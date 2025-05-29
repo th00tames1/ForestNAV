@@ -1,0 +1,10 @@
+chardet
+folium
+geopandas
+pandas
+numpy
+matplotlib
+seaborn
+fiona
+pyqt5
+PyQtWebEngine
