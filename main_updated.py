@@ -12,6 +12,7 @@ import fiona
 from PyQt5 import QtWidgets, QtGui, QtCore
 from PyQt5.QtWebEngineWidgets import QWebEngineView
 from collections import defaultdict
+import itertools
 
 # Import custom modules
 from pri_parser import PRIParser
@@ -577,61 +578,80 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.export_shp_btn.setEnabled(False)
 
-    def _update_map_tab(self):
-        self.map_view.hide();  self.map_msg.show();  self.export_shp_btn.setEnabled(False)
+    def _update_map_tab(self):                       # 기존 함수 전부 덮어쓰기
+        """모든 로드·분석된 데이터셋을 한꺼번에 지도에 표시"""
+        # 초기 상태
+        self.map_view.hide()
+        self.map_msg.show()
+        self.export_shp_btn.setEnabled(False)
 
-        if (self.tree_data is None or
-            "Latitude" not in self.tree_data.columns or
-            "Longitude" not in self.tree_data.columns):
+        # ── 1) 데이터 모으기 ─────────────────────────────
+        datasets = []   # [(레이블, df_coords, full_tree_df), …]
+        for fp in self.fileLibrary:
+            cache = self.file_cache.get(fp)
+            if not cache or "tree_data" not in cache:
+                continue          # 아직 분석 전이거나 캐시 없음
+            tdf = cache["tree_data"]
+            if {"Latitude", "Longitude"} - set(tdf.columns):
+                continue          # 좌표 없는 데이터셋은 스킵
+
+            df_coords = (tdf[["Latitude", "Longitude"]]
+                        .dropna().astype(float)
+                        .reset_index(drop=False)
+                        .rename(columns={"index": "TreeID"}))
+            if df_coords.empty:
+                continue
+            datasets.append((os.path.basename(fp), df_coords, tdf))
+
+        if not datasets:          # 표시할 게 없으면 그대로 종료
             return
 
-        df = (self.tree_data[["Latitude", "Longitude"]]
-            .dropna()
-            .astype(float)
-            .reset_index(drop=False)
-            .rename(columns={"index": "TreeID"}))
-        if df.empty:
-            return
+        # ── 2) 지도 베이스 생성 (모든 좌표 평균) ─────────────
+        lat_mean = np.mean([d[1]["Latitude"].mean() for d in datasets])
+        lon_mean = np.mean([d[1]["Longitude"].mean() for d in datasets])
+        fmap = folium.Map(location=[lat_mean, lon_mean],
+                        zoom_start=15, tiles="Esri.WorldImagery")
 
-        center = [df["Latitude"].mean(), df["Longitude"].mean()]
-        fmap = folium.Map(location=center, zoom_start=15, tiles="Esri.WorldImagery")
+        # ── 3) 컬러 팔레트 준비 ───────────────────────────
+        palette = ["red", "blue", "green", "orange", "purple",
+                "cadetblue", "magenta", "yellow", "brown"]
+        color_cycle = itertools.cycle(palette)
 
-        features = []
-        for _, row in df.iterrows():
-            props = {"TreeID": int(row.TreeID)}
-            info_html = "<br>".join([f"<b>{k}</b>: {row2}" 
-                                    for k,row2 in self.tree_data.loc[row.TreeID].items()
-                                    if pd.notna(row2)])
-            props["popup"] = info_html
-            features.append({
-                "type": "Feature",
-                "geometry": {"type": "Point",
-                            "coordinates": [row.Longitude, row.Latitude]},
-                "properties": props
-            })
+        # ── 4) 각 데이터셋을 개별 레이어로 추가 ───────────
+        for label, df_coords, tdf in datasets:
+            color = next(color_cycle)
+            feat_grp = folium.FeatureGroup(name=label)
 
-        def style(_):
-            return {"radius": 4, "color": "red", "weight": 1, "fill": True, "fillColor": "red", "fillOpacity": 0.8}
+            for _, row in df_coords.iterrows():
+                tree_idx = int(row.TreeID)
+                popup_html = "<br>".join(
+                    f"<b>{k}</b>: {v}"
+                    for k, v in tdf.loc[tree_idx].items() if pd.notna(v)
+                )
+                folium.CircleMarker(
+                    location=(row.Latitude, row.Longitude),
+                    radius=4, color=color, fill=True,
+                    fill_color=color, fill_opacity=0.8,
+                    popup=folium.Popup(popup_html, max_width=300),
+                    tooltip=f"{label} – Tree {tree_idx}"
+                ).add_to(feat_grp)
 
-        def highlight(_):
-            return {"radius": 6, "color": "yellow", "weight": 1, "fill": True, "fillColor": "yellow"}
+            feat_grp.add_to(fmap)
 
-        folium.GeoJson(
-            {"type": "FeatureCollection", "features": features},
-            name="trees",
-            marker=folium.CircleMarker(),
-            style_function=style,
-            highlight_function=highlight,
-            tooltip=folium.GeoJsonTooltip(fields=["TreeID"]),
-            popup=folium.GeoJsonPopup(fields=["popup"], labels=False, max_width=300)
-        ).add_to(fmap)
+        # ── 5) 레이어 컨트롤 & 렌더링 ─────────────────────
+        folium.LayerControl().add_to(fmap)
 
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".html")
         fmap.save(tmp.name)
         self.map_view.load(QtCore.QUrl.fromLocalFile(tmp.name))
-        self.map_view.show();  self.map_msg.hide();  self.export_shp_btn.setEnabled(True)
 
-        self._map_df_for_export = df
+        # 화면 전환
+        self.map_view.show()
+        self.map_msg.hide()
+        self.export_shp_btn.setEnabled(True)
+
+        # 내보내기용 백업 (현재 파일만 우선 저장)
+        self._map_df_for_export = self.tree_data
 
     def _export_shp(self):
         if not hasattr(self, "_map_df_for_export"):
@@ -868,11 +888,69 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Error in populate_all", str(e))
 
+    # def analyze_file(self):
+    #     if not self.current_file: return
+    #     self.analyze_button.setEnabled(False); self.statusBar().showMessage("Analyzing…")
+    #     self.parser.parse_file(self.current_file)
+    
     def analyze_file(self):
-        if not self.current_file: return
-        self.analyze_button.setEnabled(False); self.statusBar().showMessage("Analyzing…")
-        self.parser.parse_file(self.current_file)
-        
+        """Library에 담긴 모든 PRI 파일을 차례로 분석한다."""
+        if not self.fileLibrary:
+            return
+
+        # UI 상태 잠금
+        self.analyze_button.setEnabled(False)
+        self.statusBar().showMessage("Analyzing all datasets…")
+        self.progress_bar.setValue(0)
+
+        # ① 잠시 팝업/재귀 호출을 막기 위해 parsingFinished 시그널 해제
+        try:
+            self.parser.parsingFinished.disconnect(self._on_parsing_finished)
+        except TypeError:
+            pass   # 이미 끊겨 있을 수도 있음
+
+        # ② 라이브러리 순회 • 캐시에 누적
+        for fp in self.fileLibrary:
+            self.current_file = fp          # “현재 파일” 포인터 갱신
+            self.statusBar().showMessage(f"Analyzing {os.path.basename(fp)} …")
+
+            ok = self.parser.parse_file(fp)  # ← 동기식 파싱
+            if not ok:
+                continue                    # 실패한 파일은 건너뜀
+
+            tree_df = self.parser.get_tree_data()
+            log_df  = self.parser.get_log_data()
+
+            cache = self.file_cache.get(fp, {})
+            cache.update({
+                "tree_data":  tree_df,
+                "log_data":   log_df,
+                "tree_model": PandasModel(tree_df),
+                "log_model":  PandasModel(log_df),
+            })
+            self.file_cache[fp] = cache
+
+        # ③ 시그널 복구
+        self.parser.parsingFinished.connect(self._on_parsing_finished)
+
+        # ④ 마지막 파일을 화면에 띄우고, 탭/시각화/지도 업데이트
+        if self.fileLibrary:
+            self.current_file = self.fileLibrary[-1]
+            self.tree_data = self.file_cache[self.current_file]["tree_data"]
+            self.log_data  = self.file_cache[self.current_file]["log_data"]
+            self.visualizer.set_data(self.tree_data, self.log_data)
+
+        self._update_ui_after_analysis()     # → 모든 탭 다시 그림
+        self._update_map_tab()               # → 여러 세트 동시 표기
+
+        # ⑤ UI 복구
+        self.export_button.setEnabled(True)
+        self.analyze_button.setEnabled(True)
+        self.statusBar().showMessage("Analysis complete (all files)")
+        QtWidgets.QMessageBox.information(
+            self, "Analysis", "All loaded datasets have been analyzed."
+        )
+
     def _update_progress(self, p):
         self.progress_bar.setValue(int(p)); self.progress_label.setText(f"{p:.1f}%")
 

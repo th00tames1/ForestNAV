@@ -30,7 +30,7 @@ exe = EXE(
     a.datas,
     [],
     icon='icon.png',
-    name='ForesT NAV',
+    name='ForestNAV',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
