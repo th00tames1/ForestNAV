@@ -1,10 +1,3 @@
-"""
-Main GUI Application for forestNAV (Updated Version)
-
-This module implements the main GUI application with a tab-based interface
-for the PRI file parsing software.
-"""
-
 import sys, os, time, mmap, chardet
 import folium, tempfile, geopandas as gpd
 from shapely.geometry import Point
@@ -179,7 +172,6 @@ class FileLoaderThread(QtCore.QThread):
             # 감지된 인코딩으로 디코딩 (errors="replace"로 디코딩 문제 발생 방지)
             decodedStr = byteData.decode(encoding, errors="replace")
             
-            # PRI 파일은 '~'를 구분자로 각 레코드가 있음
             records = decodedStr.split("~")
             pri_list = []
             maxNum = 0
@@ -214,7 +206,7 @@ class MainWindow(QtWidgets.QMainWindow):
         super(MainWindow, self).__init__()
         self.tree_option_checkboxes = []
         self.log_option_checkboxes  = []
-        self.setWindowTitle("forestNAV - Advanced forestry Systems Lab, OSU")
+        self.setWindowTitle("ForestNAV - Advanced forestry Systems Lab, Oregon State University")
         icon_path = os.path.join(os.path.dirname(__file__), "icon.png")
         self.setWindowIcon(QtGui.QIcon(icon_path))
         self.resize(1400, 900)
@@ -239,6 +231,9 @@ class MainWindow(QtWidgets.QMainWindow):
         
         # 드래그 앤 드롭 사용 설정
         self.setAcceptDrops(True)
+
+        self.file_cache: Dict[str, Dict[str, Any]] = {}
+        self._preload_threads = {}
         
     def _create_menu(self):
         menubar = self.menuBar()
@@ -297,9 +292,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.left_panel_layout = QtWidgets.QVBoxLayout(self.left_panel)
         
         # 드래그 앤 드롭 영역
-        self.drop_frame = QtWidgets.QGroupBox("Drag and Drop File")
+        self.drop_frame = QtWidgets.QGroupBox("Open File")
         self.drop_layout = QtWidgets.QVBoxLayout(self.drop_frame)
-        self.drop_label = QtWidgets.QLabel("Drag and drop the PRI file here")
+        self.drop_label = QtWidgets.QLabel("Drag and drop the file here")
         self.drop_label.setAlignment(QtCore.Qt.AlignCenter)
         self.drop_layout.addWidget(self.drop_label)
         self.left_panel_layout.addWidget(self.drop_frame)
@@ -308,7 +303,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.open_button = QtWidgets.QPushButton("Open File")
         self.open_button.clicked.connect(self.open_file_dialog)
         self.left_panel_layout.addWidget(self.open_button)
-        
+
         # 파일 정보
         self.file_info_frame = QtWidgets.QGroupBox("File Information")
         self.file_info_layout = QtWidgets.QVBoxLayout(self.file_info_frame)
@@ -316,6 +311,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.file_info_label.setWordWrap(True)
         self.file_info_layout.addWidget(self.file_info_label)
         self.left_panel_layout.addWidget(self.file_info_frame)
+
+        self.fileLibrary = []
+        self.file_list_widget = QtWidgets.QListWidget()
+        self.file_list_widget.setMaximumHeight(150)
+        self.file_list_widget.itemClicked.connect(self.on_library_item_clicked)
+        self.file_info_layout.addWidget(self.file_list_widget)
         
         # 분석 컨트롤
         self.control_frame = QtWidgets.QGroupBox("Analysis Controls")
@@ -499,14 +500,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.viz_type_combo = QtWidgets.QComboBox()
         self.viz_type_combo.addItems([
             "DBH Distribution",
-            "Volume Distribution (m3)",
-            "Volume Distribution (dl)",
             "Log Length Distribution",
             "Diameter ob Top Distribution",
             "Diameter ob Mid Distribution",
             "Diameter ub Top Distribution",
             "Diameter ub Mid Distribution",
             "Species Distribution"
+            "Volume Distribution (m3)",
+            "Volume Distribution (dl)",
         ])
         self.viz_type_combo.currentIndexChanged.connect(self._update_visualization)
         ctrl_bar.addWidget(self.viz_type_combo)
@@ -695,9 +696,12 @@ class MainWindow(QtWidgets.QMainWindow):
             return None
 
     def open_file_dialog(self):
-        fname, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Open PRI File", "", "PRI Files (*.pri)")
-        if fname:
-            self.load_file(fname)
+        fnames, _ = QtWidgets.QFileDialog.getOpenFileNames(self, "Open StanforD Files", "", "Files (*.pri)")
+        if not fnames:
+            return
+        for f in fnames:
+            self._add_to_library(f)
+        self.load_file(fnames[0])
     
     # 드래그 앤 드롭 관련 이벤트 처리
     def dragEnterEvent(self, event):
@@ -706,15 +710,24 @@ class MainWindow(QtWidgets.QMainWindow):
                 if url.toLocalFile().lower().endswith(".pri"):
                     event.acceptProposedAction()
                     return
+        
         event.ignore()
     
     def dropEvent(self, event):
-        if event.mimeData().hasUrls():
-            for url in event.mimeData().urls():
-                filepath = url.toLocalFile()
-                if filepath.lower().endswith(".pri"):
-                    self.load_file(filepath)
-                    break
+        if not event.mimeData().hasUrls():
+            return
+        
+        files = []
+        for url in event.mimeData().urls():
+            fp = url.toLocalFile()
+            if fp.lower().endswith(".pri"):
+                files.append(fp)
+        if not files:
+            return
+        
+        for f in files:
+            self._add_to_library(f)
+        self.load_file(files[0])        
 
     def _reset_data(self):
         """Reset all data when loading a new file"""
@@ -748,14 +761,33 @@ class MainWindow(QtWidgets.QMainWindow):
             if i != raw_idx:
                 self.tab_control.setTabEnabled(i, False)
 
+    def _add_to_library(self, filepath):
+        if filepath in self.fileLibrary:
+            return
+        self.fileLibrary.append(filepath)
+        item = QtWidgets.QListWidgetItem(os.path.basename(filepath))
+        item.setData(QtCore.Qt.UserRole, filepath)
+        self.file_list_widget.addItem(item)
+
+        self._preload_file(filepath)
+
+    def on_library_item_clicked(self, item):
+        filepath = item.data(QtCore.Qt.UserRole)
+        if filepath:
+            self.load_file(filepath)    
+
     # 파일 로딩: QThread와 QProgressDialog 사용
     def load_file(self, filename):
         try:
-            # 기존 데이터 초기화
+            if filename in self.file_cache:
+                self.apply_cached_file(filename)
+                return
+
             self._reset_data()
-            
             self.current_file = filename
-            self.progressDialog = QtWidgets.QProgressDialog("Loading file...", "Cancel", 0, 100, self)
+
+            self.progressDialog = QtWidgets.QProgressDialog(
+                "Loading file...", "Cancel", 0, 100, self)
             self.progressDialog.setWindowModality(QtCore.Qt.WindowModal)
             self.progressDialog.setMinimumDuration(0)
             self.progressDialog.show()
@@ -782,10 +814,26 @@ class MainWindow(QtWidgets.QMainWindow):
         self.openingFile = pri_list
         self.maxNum = maxNum
         self.populate_all()
-        self.setWindowTitle("forestNAV - " + os.path.basename(self.loaderThread.filename))
+        self.setWindowTitle("ForestNAV - " + os.path.basename(self.loaderThread.filename))
+        # close the loader dialog and update status
         self.progressDialog.close()
-
+        
         self.statusBar().showMessage(f"File loaded: {os.path.basename(self.loaderThread.filename)}")
+        raw_model  = PandasModel(self.df)
+        cache = {
+            "openingFile": self.openingFile,
+            "maxNum":      self.maxNum,
+            "df":          self.df,
+            "raw_model":   raw_model
+        }
+        if hasattr(self, "tree_data") and self.tree_data is not None:
+            cache.update({
+                "tree_data":  self.tree_data,
+                "log_data":   self.log_data,
+                "tree_model": PandasModel(self.tree_data),
+                "log_model":  PandasModel(self.log_data),
+            })
+        self.file_cache[self.current_file] = cache
 
     def _on_auto_clicked(self):
         self.bin_start_edit.clear()
@@ -794,11 +842,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_visualization()
 
     def populate_all(self):
-        """
-        openingFile 리스트의 순서대로 pf.valueArr를 세로로 쌓아서
-        DataFrame을 만들고, 컬럼명은 pf.number(str)만 사용합니다.
-        같은 번호가 여러 번 나와도 모두 별개 컬럼으로 표시됩니다.
-        """
         try:
             max_len = max((len(pf.valueArr) for pf in self.openingFile), default=0)
 
@@ -847,6 +890,15 @@ class MainWindow(QtWidgets.QMainWindow):
             "Analysis",
             "Analysis complete."
         )
+
+        cache = self.file_cache.get(self.current_file, {})
+        cache.update({
+            "tree_data":  self.tree_data,
+            "log_data":   self.log_data,
+            "tree_model": PandasModel(self.tree_data),
+            "log_model":  PandasModel(self.log_data),
+        })
+        self.file_cache[self.current_file] = cache
     
     def _update_ui_after_analysis(self):
         for i in range(self.tab_control.count()):
@@ -884,7 +936,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 if name == "# of trees":
                     lines.append(f"The number of trees: {len(td)}")
                 elif name == "DBH" and "DBH" in td.columns:
-                    s = td["DBH"].astype(float).dropna()
+                    s = td["DBH"].astype(float).replace(0, np.nan).dropna()
                     lines.append(f"DBH (mm): mean {s.mean():.2f} | min {s.min():.2f} | max {s.max():.2f}")
                 elif name == "Coordinates" and {"Latitude","Longitude"}<=set(td.columns):
                     lat = td["Latitude"].astype(float).dropna()
@@ -916,29 +968,29 @@ class MainWindow(QtWidgets.QMainWindow):
                     pos  = "Top" if "Top" in name else "Mid"
                     col  = f"Diameter ({pos} mm {side})"
                     if col in ld.columns:
-                        s = ld[col].astype(float).dropna()
+                        s = ld[col].astype(float).replace(0, np.nan).dropna()
                         lines.append(f"{col}: mean {s.mean():.2f} | min {s.min():.2f} | max {s.max():.2f}")
                 elif name == "Length (cm)":
                     col = self.visualizer.column_mapping["length"]
                     if col in ld.columns:
-                        s = ld[col].astype(float).dropna()
+                        s = ld[col].astype(float).replace(0, np.nan).dropna()
                         lines.append(f"{col}: mean {s.mean():.2f} | min {s.min():.2f} | max {s.max():.2f}")
                 elif name == "Volume (m3)":
                     for c in ["Volume (m3sob)", "Volume (m3sub)"]:
                         if c in ld.columns:
-                            s = ld[c].astype(float).dropna()
+                            s = ld[c].astype(float).replace(0, np.nan).dropna()
                             lines.append(f"{c}: mean {s.mean():.3f} | min {s.min():.3f} | max {s.max():.3f}")
                             break
                 elif name == "Volume (dl)":
                     col = "Volume (Var161) in dl"
                     if col in ld.columns:
-                        s = ld[col].astype(float).dropna()
+                        s = ld[col].astype(float).replace(0, np.nan).dropna()
                         lines.append(f"{col}: mean {s.mean():.2f} | min {s.min():.2f} | max {s.max():.2f}")
                 
                 elif name == "Volume (Decimal)":
                     col = "Volume (Decimal)"
                     if col in ld.columns:
-                        s = ld[col].astype(float).dropna()
+                        s = ld[col].astype(float).replace(0, np.nan).dropna()
                         lines.append(f"{col}: mean {s.mean():.2f} | min {s.min():.2f} | max {s.max():.2f}")
                         
             self.log_summary_text.setText("\n".join(lines) or "Please select at least one field.")
@@ -1098,11 +1150,10 @@ class MainWindow(QtWidgets.QMainWindow):
     def show_about(self):
         """Show about dialog"""
         QtWidgets.QMessageBox.about(self, "About forestNAV", 
-                                   "forestNAV - PRI File Analysis Tool\n"
-                                   "Version: 1.01\n"
-                                   "This software is designed for analyzing StanforD harvester head data files.\n\n"
-                                   "Advanced forestry Systems Lab\n"
+                                   "forestNAV - StanforD Harvester Head Data Analysis Tool\n"
+                                   "Version: 0.10 Alpha\n"
                                    "Heechan Jeong and Heesung Woo\n"
+                                   "Advanced forestry Systems Lab\n"
                                    "Oregon State University"
                                    )
     
@@ -1110,7 +1161,7 @@ class MainWindow(QtWidgets.QMainWindow):
         reply = QtWidgets.QMessageBox.question(
             self,
             "Exit",
-            "Are you sure you want to quit the forestNAV software?",
+            "Are you sure you want to quit the forestNAV?",
             QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
             QtWidgets.QMessageBox.No,
         )
@@ -1118,6 +1169,81 @@ class MainWindow(QtWidgets.QMainWindow):
             event.accept()
         else:
             event.ignore()
+
+    def apply_cached_file(self, filepath):
+        cache = self.file_cache[filepath]
+
+        # --- 핵심 데이터 복원 -------------------------------------------
+        self.current_file = filepath
+        self.openingFile  = cache["openingFile"]
+        self.maxNum       = cache["maxNum"]
+        self.df           = cache["df"]
+
+        # --- Raw Data 탭 -------------------------------------------------
+        self.raw_data_table.setModel(cache.get("raw_model")
+                                 or PandasModel(self.df))
+        self.raw_data_table.resizeColumnsToContents()
+
+        if "tree_data" in cache and "log_data" in cache:
+            self.tree_data = cache["tree_data"]
+            self.log_data  = cache["log_data"]
+
+            # ▸ 모델이 없으면 즉석에서 만들어 꽂아 줍니다.
+            self.tree_table.setModel(cache.get("tree_model")
+                                    or PandasModel(self.tree_data))
+            self.log_table.setModel (cache.get("log_model")
+                                    or PandasModel(self.log_data))
+
+            self.visualizer.set_data(self.tree_data, self.log_data)
+            self._update_ui_after_analysis()
+        else:
+            # 아직 분석 전인 파일이면 Raw Data 탭만 살려 둡니다.
+            raw_idx = self.tab_control.indexOf(self.raw_data_tab)
+            for i in range(self.tab_control.count()):
+                self.tab_control.setTabEnabled(i, i == raw_idx)
+            self.analyze_button.setEnabled(True)
+
+        # --- 상태바·파일 정보 -------------------------------------------
+        size_kb = os.path.getsize(filepath) / 1024
+        self.file_info_label.setText(
+            f"File: {os.path.basename(filepath)}\nSize: {size_kb:.2f} KB"
+        )
+        self.statusBar().showMessage(f"Loaded from cache: {os.path.basename(filepath)}")
+
+    def _preload_file(self, filepath: str):
+        """파일을 미리 파싱해 cache 에 넣는다(진행바 없이)."""
+        if filepath in self.file_cache or filepath in self._preload_threads:
+            return                      # 이미 끝났거나 진행 중
+        th = FileLoaderThread(filepath)
+        th.loadingFinished.connect(
+            lambda pri, mx, fp=filepath: self._on_preload_finished(fp, pri, mx)
+        )
+        th.start()
+        self._preload_threads[filepath] = th
+
+    def _on_preload_finished(self, filepath, pri_list, max_num):
+        # populate_all()과 동일한 방식으로 DataFrame 생성
+        max_len = max((len(p.valueArr) for p in pri_list), default=0)
+        matrix, cols = [], []
+        for p in pri_list:
+            arr = list(p.valueArr) + [""] * (max_len - len(p.valueArr))
+            matrix.append(arr)
+            cols.append(str(p.number))
+        df = pd.DataFrame(matrix).T
+        df.columns = cols
+
+        # 캐시에 통째로 보관(PandasModel까지)
+        self.file_cache[filepath] = {
+            "openingFile": pri_list,
+            "maxNum":      max_num,
+            "df":          df,
+            "raw_model":   PandasModel(df),
+        }
+
+        # 스레드 정리
+        th = self._preload_threads.pop(filepath, None)
+        if th:
+            th.deleteLater()
 
 if __name__ == "__main__":
     app = QtWidgets.QApplication(sys.argv)

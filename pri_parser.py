@@ -1,9 +1,3 @@
-"""
-PRI File Parser (PyQt5 Version)
-
-This module provides functionality for parsing PRI files.
-"""
-
 import os, chardet
 import folium, tempfile
 import pandas as pd
