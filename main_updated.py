@@ -88,15 +88,13 @@ class FlowLayout(QtWidgets.QLayout):
             lineH = max(lineH, h)
         return y + lineH - rect.y()
 
-
-# PriFile 클래스 (원래 PriFile.py 참고)
 class PriFile:
     def __init__(self, num, val):
-        self.number = num                       # Var
-        tokens      = val.strip().split()       # <type> <value …>
-        self.type   = tokens[0] if tokens else ""   # Type
-        self.value  = " ".join(tokens[1:])           # Value(나머지 전부)
-        self.valueArr = tokens                  # ← 기존 코드가 쓰고 있으므로 유지
+        self.number = num 
+        tokens      = val.strip().split()
+        self.type   = tokens[0] if tokens else ""
+        self.value  = " ".join(tokens[1:])
+        self.valueArr = tokens
 
 class PandasModel(QtCore.QAbstractTableModel):
     def __init__(self, df=pd.DataFrame(), parent=None):
@@ -131,13 +129,12 @@ class PandasModel(QtCore.QAbstractTableModel):
         
     def flags(self, index):
         default = super().flags(index)
-        return default | QtCore.Qt.ItemIsDragEnabled          # 드래그 가능
+        return default | QtCore.Qt.ItemIsDragEnabled 
 
     def supportedDragActions(self):
-        return QtCore.Qt.CopyAction                           # 복사‑붙여넣기 전용
+        return QtCore.Qt.CopyAction
 
     def mimeData(self, indexes):
-        # 선택된 셀들을 탭‑구분, 줄‑구분 텍스트로 묶어 클립보드에 제공
         rows = {}
         for idx in indexes:
             rows.setdefault(idx.row(), {})[idx.column()] = str(
@@ -154,7 +151,7 @@ class PandasModel(QtCore.QAbstractTableModel):
 
 class FileLoaderThread(QtCore.QThread):
     progressChanged = QtCore.pyqtSignal(int)
-    loadingFinished = QtCore.pyqtSignal(list, int)  # (pri_list, maxNum)
+    loadingFinished = QtCore.pyqtSignal(list, int)
     
     def __init__(self, filename):
         super(FileLoaderThread, self).__init__()
@@ -168,9 +165,8 @@ class FileLoaderThread(QtCore.QThread):
             detected = chardet.detect(byteData)
             encoding = detected.get("encoding")
             if not encoding:
-                encoding = "utf-8"  # 감지 실패 시, 기본값 설정
+                encoding = "utf-8"
             
-            # 감지된 인코딩으로 디코딩 (errors="replace"로 디코딩 문제 발생 방지)
             decodedStr = byteData.decode(encoding, errors="replace")
             
             records = decodedStr.split("~")
@@ -185,9 +181,9 @@ class FileLoaderThread(QtCore.QThread):
                         continue
                     priKey = parts[0]
                     if priKey in ("257", "267"):
-                        priVal = parts[1].strip()          # 개행 유지
+                        priVal = parts[1].strip()
                     else:
-                        priVal = parts[1].replace("\n", " ")  # 나머지는 한 줄로
+                        priVal = parts[1].replace("\n", " ") 
                     pf = PriFile(priKey, priVal)
                     pri_list.append(pf)
                     if len(pf.valueArr) > maxNum:
@@ -215,22 +211,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.maxNum = 0
         self.df = None
         
-        # PRI 파서 및 시각화 객체 생성
         self.parser = PRIParser()
         self.visualizer = DataVisualizer()
         
-        # 현재 로드된 파일 경로
         self.current_file = None
         
-        # 분석 결과 데이터
         self.tree_data = None
         self.log_data = None
         
-        # UI 초기화
         self._create_menu()
         self._init_ui()
         
-        # 드래그 앤 드롭 사용 설정
         self.setAcceptDrops(True)
 
         self.file_cache: Dict[str, Dict[str, Any]] = {}
