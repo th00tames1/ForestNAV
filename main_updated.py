@@ -11,6 +11,7 @@ import logging
 import fiona
 from PyQt5 import QtWidgets, QtGui, QtCore
 from PyQt5.QtWebEngineWidgets import QWebEngineView
+from PyQt5.QtCore import QSettings
 from collections import defaultdict
 import itertools
 
@@ -197,19 +198,54 @@ class FileLoaderThread(QtCore.QThread):
             import traceback
             logger.error(f"Error loading file: {e}\n{traceback.format_exc()}")
 
+class ExportSettingsDialog(QtWidgets.QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Export Settings - Coordinate System")
+        self.setModal(True)
+        self.resize(360, 120)
+
+        layout = QtWidgets.QVBoxLayout(self)
+
+        label = QtWidgets.QLabel("Select default coordinate system (CRS):", self)
+        layout.addWidget(label)
+
+        self.crs_combo = QtWidgets.QComboBox(self)
+        self.crs_combo.addItem("WGS 84 (EPSG:4326)", "EPSG:4326")
+        self.crs_combo.addItem("WGS 84 / Pseudo-Mercator (Web Mercator) (EPSG:3857)", "EPSG:3857")
+        self.crs_combo.addItem("WGS 84 / World Mercator (EPSG:3395)", "EPSG:3395")
+        self.crs_combo.addItem("WGS 84 / Plate Carrée (EPSG:32662)", "EPSG:32662")
+        self.crs_combo.addItem("WGS 84 / World Cylindrical Equal Area (EPSG:54034)", "EPSG:54034")
+        self.crs_combo.addItem("NAD83 (EPSG:4269)", "EPSG:4269")
+        self.crs_combo.addItem("ETRS89 (EPSG:4258)", "EPSG:4258")
+        layout.addWidget(self.crs_combo)
+
+        btn_box = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Save | QtWidgets.QDialogButtonBox.Cancel,
+            QtCore.Qt.Horizontal, self
+        )
+        btn_box.accepted.connect(self.accept)
+        btn_box.rejected.connect(self.reject)
+        layout.addWidget(btn_box)
+
+    def selected_crs(self):
+        return self.crs_combo.currentData()
+    
 # 메인 윈도우: 탭 기반 인터페이스 및 데이터 표시
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super(MainWindow, self).__init__()
         self.tree_option_checkboxes = []
         self.log_option_checkboxes  = []
-        self.setWindowTitle("ForestNAV - Advanced forestry Systems Lab, Oregon State University")
+        self.sw_version = "0.11"
+        self.setWindowTitle(f"ForestNAV {self.sw_version} - Advanced forestry Systems Lab, Oregon State University")
         icon_path = os.path.join(os.path.dirname(__file__), "icon.png")
         self.setWindowIcon(QtGui.QIcon(icon_path))
         self.resize(1400, 900)
         self.openingFile = []
         self.maxNum = 0
         self.df = None
+        self.settings = QSettings("OSU_AFLab", "ForestNAV")
         
         self.parser = PRIParser()
         self.visualizer = DataVisualizer()
@@ -263,6 +299,15 @@ class MainWindow(QtWidgets.QMainWindow):
         visualizationAct = QtWidgets.QAction("Visualization", self)
         visualizationAct.triggered.connect(lambda: self.tab_control.setCurrentIndex(4))
         viewMenu.addAction(visualizationAct)
+        
+        settingMenu = menubar.addMenu("Settings")
+        filepathAct = QtWidgets.QAction("File Path", self)
+        filepathAct.triggered.connect(self.show_file_path_settings)
+        settingMenu.addAction(filepathAct)
+        
+        exportSettingsAct = QtWidgets.QAction("Export Settings", self)
+        exportSettingsAct.triggered.connect(self.show_export_settings)
+        settingMenu.addAction(exportSettingsAct)
         
         helpMenu = menubar.addMenu("Help")
         aboutAct = QtWidgets.QAction("About", self)
@@ -498,8 +543,6 @@ class MainWindow(QtWidgets.QMainWindow):
             "Diameter ub Top Distribution",
             "Diameter ub Mid Distribution",
             "Species Distribution"
-            "Volume Distribution (m3)",
-            "Volume Distribution (dl)",
         ])
         self.viz_type_combo.currentIndexChanged.connect(self._update_visualization)
         ctrl_bar.addWidget(self.viz_type_combo)
@@ -555,10 +598,7 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addWidget(self.map_view, stretch=5)
 
         btn_bar = QtWidgets.QHBoxLayout()
-        self.export_shp_btn = QtWidgets.QPushButton("Export SHP")
-        self.export_shp_btn.clicked.connect(self._export_shp)
         btn_bar.addStretch()
-        btn_bar.addWidget(self.export_shp_btn)
         btn_wrap = QtWidgets.QWidget()
         btn_wrap.setLayout(btn_bar)
         layout.addWidget(btn_wrap, stretch=0)
@@ -567,24 +607,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self.map_msg.setAlignment(QtCore.Qt.AlignCenter)
         layout.addWidget(self.map_msg, 0, QtCore.Qt.AlignCenter)
 
-        self.export_shp_btn.setEnabled(False)
-
-    def _update_map_tab(self):                       # 기존 함수 전부 덮어쓰기
-        """모든 로드·분석된 데이터셋을 한꺼번에 지도에 표시"""
-        # 초기 상태
+    def _update_map_tab(self):
         self.map_view.hide()
         self.map_msg.show()
-        self.export_shp_btn.setEnabled(False)
 
         # ── 1) 데이터 모으기 ─────────────────────────────
-        datasets = []   # [(레이블, df_coords, full_tree_df), …]
+        datasets = []
         for fp in self.fileLibrary:
             cache = self.file_cache.get(fp)
             if not cache or "tree_data" not in cache:
-                continue          # 아직 분석 전이거나 캐시 없음
+                continue
             tdf = cache["tree_data"]
             if {"Latitude", "Longitude"} - set(tdf.columns):
-                continue          # 좌표 없는 데이터셋은 스킵
+                continue
 
             df_coords = (tdf[["Latitude", "Longitude"]]
                         .dropna().astype(float)
@@ -594,18 +629,22 @@ class MainWindow(QtWidgets.QMainWindow):
                 continue
             datasets.append((os.path.basename(fp), df_coords, tdf))
 
-        if not datasets:          # 표시할 게 없으면 그대로 종료
+        if not datasets:
             return
 
         # ── 2) 지도 베이스 생성 (모든 좌표 평균) ─────────────
         lat_mean = np.mean([d[1]["Latitude"].mean() for d in datasets])
         lon_mean = np.mean([d[1]["Longitude"].mean() for d in datasets])
         fmap = folium.Map(location=[lat_mean, lon_mean],
-                        zoom_start=15, tiles="Esri.WorldImagery")
+                        zoom_start=16, tiles="Esri.WorldImagery")
 
         # ── 3) 컬러 팔레트 준비 ───────────────────────────
-        palette = ["red", "blue", "green", "orange", "purple",
-                "cadetblue", "magenta", "yellow", "brown"]
+        palette = [
+            "#e6194b", "#3cb44b", "#ffe119", "#4363d8", "#f58231",
+            "#911eb4", "#46f0f0", "#f032e6", "#bcf60c", "#fabebe",
+            "#008080", "#e6beff", "#9a6324", "#fffac8", "#800000",
+            "#aaffc3", "#808000", "#ffd8b1", "#000075", "#808080"
+        ]
         color_cycle = itertools.cycle(palette)
 
         # ── 4) 각 데이터셋을 개별 레이어로 추가 ───────────
@@ -615,16 +654,31 @@ class MainWindow(QtWidgets.QMainWindow):
 
             for _, row in df_coords.iterrows():
                 tree_idx = int(row.TreeID)
+                # popup_html = "<br>".join(
+                #     f"<b>{k}</b>: {v}"
+                #     for k, v in tdf.loc[tree_idx].items() if pd.notna(v)
+                # )
+                # folium.CircleMarker(
+                #     location=(row.Latitude, row.Longitude),
+                #     radius=4, color=color, fill=True,
+                #     fill_color=color, fill_opacity=0.8,
+                #     popup=folium.Popup(popup_html, max_width=300),
+                #     tooltip=f"{label} – Tree {tree_idx}"
+                # ).add_to(feat_grp)
+
+                stem_number = tdf.loc[tree_idx, 'Tree ID (Stem Number)']
+                tooltip_text = f"Tree ID (Stem Number): {stem_number}"
+
                 popup_html = "<br>".join(
                     f"<b>{k}</b>: {v}"
                     for k, v in tdf.loc[tree_idx].items() if pd.notna(v)
                 )
                 folium.CircleMarker(
                     location=(row.Latitude, row.Longitude),
-                    radius=4, color=color, fill=True,
+                    radius=3, color=color, fill=True,
                     fill_color=color, fill_opacity=0.8,
+                    tooltip=tooltip_text,
                     popup=folium.Popup(popup_html, max_width=300),
-                    tooltip=f"{label} – Tree {tree_idx}"
                 ).add_to(feat_grp)
 
             feat_grp.add_to(fmap)
@@ -639,35 +693,11 @@ class MainWindow(QtWidgets.QMainWindow):
         # 화면 전환
         self.map_view.show()
         self.map_msg.hide()
-        self.export_shp_btn.setEnabled(True)
 
         # 내보내기용 백업 (현재 파일만 우선 저장)
         self._map_df_for_export = self.tree_data
 
-    def _export_shp(self):
-        if not hasattr(self, "_map_df_for_export"):
-            QtWidgets.QMessageBox.information(self, "Info", "Nothing to export.")
-            return
-
-        dir_path = QtWidgets.QFileDialog.getExistingDirectory(self, "Select export directory")
-        if not dir_path:
-            return
-
-        try:
-            gdf = gpd.GeoDataFrame(
-                self.tree_data.loc[self._map_df_for_export.TreeID].reset_index(drop=True),
-                geometry=[Point(lon, lat) for lat, lon
-                        in zip(self._map_df_for_export.Latitude, self._map_df_for_export.Longitude)],
-                crs="EPSG:4326"
-            )
-            shp_path = os.path.join(dir_path, "tree_locations.shp")
-            gdf.to_file(shp_path, driver="ESRI Shapefile")
-            QtWidgets.QMessageBox.information(self, "Export", f"SHP saved to:\n{shp_path}")
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Error", str(e))
-
     def _get_bin_params(self):
-        """Returns (range_tuple_or_None, bins_int_or_None)"""
         try:
             s = self.bin_start_edit.text().strip()
             e = self.bin_end_edit.text().strip()
@@ -707,9 +737,18 @@ class MainWindow(QtWidgets.QMainWindow):
             return None
 
     def open_file_dialog(self):
-        fnames, _ = QtWidgets.QFileDialog.getOpenFileNames(self, "Open StanforD Files", "", "Files (*.pri)")
+        default_dir = self.settings.value("defaultFilePath", os.getcwd())
+        fnames, _ = QtWidgets.QFileDialog.getOpenFileNames(
+            self,
+            "Open StanforD Files",
+            default_dir,
+            "Files (*.pri *.apt *.prd *.stm *.drf)"
+        )
         if not fnames:
             return
+        new_dir = os.path.dirname(fnames[0])
+        self.settings.setValue("defaultFilePath", new_dir)
+
         for f in fnames:
             self._add_to_library(f)
         self.load_file(fnames[0])
@@ -718,7 +757,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
             for url in event.mimeData().urls():
-                if url.toLocalFile().lower().endswith(".pri"):
+                fp = url.toLocalFile().lower()
+                if fp.endswith(".pri") or fp.endswith(".apt") or fp.endswith(".prd") or fp.endswith(".stm") or fp.endswith(".drf"):
                     event.acceptProposedAction()
                     return
         
@@ -731,7 +771,8 @@ class MainWindow(QtWidgets.QMainWindow):
         files = []
         for url in event.mimeData().urls():
             fp = url.toLocalFile()
-            if fp.lower().endswith(".pri"):
+            lower_fp = fp.lower()
+            if lower_fp.endswith(".pri") or lower_fp.endswith(".apt") or lower_fp.endswith(".prd") or lower_fp.endswith(".stm") or lower_fp.endswith(".drf"):
                 files.append(fp)
         if not files:
             return
@@ -825,7 +866,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.openingFile = pri_list
         self.maxNum = maxNum
         self.populate_all()
-        self.setWindowTitle("ForestNAV - " + os.path.basename(self.loaderThread.filename))
+        self.setWindowTitle("ForestNAV " + self.sw_version)
         # close the loader dialog and update status
         self.progressDialog.close()
         
@@ -1144,66 +1185,67 @@ class MainWindow(QtWidgets.QMainWindow):
         self.canvas.draw()
     
     def export_results(self):
-        """Export analysis results"""
-        if not self.tree_data is not None or not self.log_data is not None:
-            QtWidgets.QMessageBox.information(self, "Info", "No data to export.")
+        """Export analysis results for all loaded PRI files"""
+        if not self.fileLibrary:
+            QtWidgets.QMessageBox.information(self, "Info", "No files to export.")
             return
-        
-        # 내보내기 디렉토리 선택
-        export_dir = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Export Directory")
-        if not export_dir:
-            return
-        
-        try:
-            # 트리 데이터 내보내기
-            if self.tree_data is not None and not self.tree_data.empty:
-                tree_file = os.path.join(export_dir, "tree_data.csv")
-                self.tree_data.to_csv(tree_file, index=False)
-            
-            # 로그 데이터 내보내기
-            if self.log_data is not None and not self.log_data.empty:
-                log_file = os.path.join(export_dir, "log_data.csv")
-                self.log_data.to_csv(log_file, index=False)
-            
-            # 요약 정보 내보내기
-            summary_file = os.path.join(export_dir, "summary.txt")
-            with open(summary_file, "w") as f:
-                f.write(self.file_summary_text.toPlainText() + "\n\n")
-                f.write(self.tree_summary_text.toPlainText() + "\n\n")
-                f.write(self.log_summary_text.toPlainText())
-            
-            # 시각화 내보내기
-            viz_file = os.path.join(export_dir, "visualization.png")
-            self.figure.savefig(viz_file, dpi=300, bbox_inches="tight")
 
-            try:
-                if (
-                    self.tree_data is not None
-                    and {"Latitude", "Longitude"}.issubset(self.tree_data.columns)
-                    and not self.tree_data[["Latitude", "Longitude"]].dropna().empty
-                ):
-                    gdf = gpd.GeoDataFrame(
-                        self.tree_data.copy(),
-                        geometry=[
-                            Point(lon, lat)
-                            for lat, lon in zip(
-                                self.tree_data["Latitude"].astype(float),
-                                self.tree_data["Longitude"].astype(float),
-                            )
-                        ],
-                        crs="EPSG:4326",
-                    )
-                    shp_path = os.path.join(export_dir, "tree_locations.shp")
-                    gdf.to_file(shp_path, driver="ESRI Shapefile")
-            except Exception as e:
-                QtWidgets.QMessageBox.warning(self, "SHP Export",
-                                            f"SHP 저장 중 오류:\n{e}")
-            
-            QtWidgets.QMessageBox.information(self, "Info", "Export Completed")
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Error", str(e))
+        # 최상위 내보내기 폴더 선택 (기본 경로는 이전에 저장된 defaultFilePath 사용)
+        default_export_dir = self.settings.value("defaultFilePath", os.getcwd())
+        base_dir = QtWidgets.QFileDialog.getExistingDirectory(
+            self, "Select Base Export Directory", default_export_dir
+        )
+        if not base_dir:
+            return
+
+        # 사용자가 선택한 경로를 다시 defaultFilePath 로 저장 (혹시 export 디렉토리도 기본으로 쓸 수 있게)
+        self.settings.setValue("defaultFilePath", base_dir)
+
+        # 기본 좌표계 불러오기 (없으면 EPSG:4326 로 간주)
+        default_crs = self.settings.value("defaultExportCRS", "EPSG:4326")
+
+        for fp in self.fileLibrary:
+            name = os.path.splitext(os.path.basename(fp))[0]
+            tgt_dir = os.path.join(base_dir, f"{name}_export")
+            os.makedirs(tgt_dir, exist_ok=True)
+
+            # 캐시에서 해당 파일의 데이터 가져오기
+            cache = self.file_cache.get(fp, {})
+            tree_df = cache.get("tree_data")
+            log_df  = cache.get("log_data")
+
+            # 1) Tree CSV
+            if tree_df is not None and not tree_df.empty:
+                # 일반 CSV 저장
+                tree_csv_path = os.path.join(tgt_dir, f"{name}_tree.csv")
+                tree_df.to_csv(tree_csv_path, index=False)
+
+                # GeoDataFrame 을 만들어 좌표계 정보와 함께 shapefile 로 저장 (예시)
+                if {"Latitude", "Longitude"} <= set(tree_df.columns):
+                    try:
+                        gdf = gpd.GeoDataFrame(
+                            tree_df.copy(),
+                            geometry=gpd.points_from_xy(
+                                tree_df["Longitude"].astype(float),
+                                tree_df["Latitude"].astype(float)
+                            ),
+                            crs="EPSG:4326"  # 원본 위도/경도가 WGS84 라 가정
+                        )
+                        # 설정된 기본 CRS 로 변환
+                        if default_crs and default_crs != "EPSG:4326":
+                            gdf = gdf.to_crs(default_crs)
+                        shp_path = os.path.join(tgt_dir, f"{name}_tree.shp")
+                        gdf.to_file(shp_path)
+                    except Exception as e:
+                        logger.warning(f"Could not export tree shapefile for {name}: {e}")
+
+            # 2) Log CSV
+            if log_df is not None and not log_df.empty:
+                log_csv_path = os.path.join(tgt_dir, f"{name}_log.csv")
+                log_df.to_csv(log_csv_path, index=False)
+
+        QtWidgets.QMessageBox.information(self, "Export", "Export complete.")
     
-    # export_file: pandas DataFrame을 사용하면 내보내기도 간편
     def export_file(self):
         try:
             if self.df is None or self.df.empty:
@@ -1220,7 +1262,7 @@ class MainWindow(QtWidgets.QMainWindow):
         """Show about dialog"""
         QtWidgets.QMessageBox.about(self, "About forestNAV", 
                                    "forestNAV - StanforD Harvester Head Data Analysis Tool\n"
-                                   "Version: 0.10 Alpha\n"
+                                   f"Version: {self.sw_version}\n"
                                    "Heechan Jeong and Heesung Woo\n"
                                    "Advanced forestry Systems Lab\n"
                                    "Oregon State University"
@@ -1313,6 +1355,32 @@ class MainWindow(QtWidgets.QMainWindow):
         th = self._preload_threads.pop(filepath, None)
         if th:
             th.deleteLater()
+
+    def show_file_path_settings(self):
+        current_dir = self.settings.value("defaultFilePath", os.getcwd())
+        selected_dir = QtWidgets.QFileDialog.getExistingDirectory(
+            self, "Select Default File Path", current_dir
+        )
+        if selected_dir:
+            self.settings.setValue("defaultFilePath", selected_dir)
+            QtWidgets.QMessageBox.information(
+                self, "Settings", f"Default File Path set to:\n{selected_dir}"
+            )
+
+    def show_export_settings(self):
+        dlg = ExportSettingsDialog(self)
+        saved_crs = self.settings.value("defaultExportCRS", "EPSG:4326")
+        idx = dlg.crs_combo.findData(saved_crs)
+        if idx >= 0:
+            dlg.crs_combo.setCurrentIndex(idx)
+
+        if dlg.exec_() == QtWidgets.QDialog.Accepted:
+            selected_crs = dlg.selected_crs()
+            if selected_crs:
+                self.settings.setValue("defaultExportCRS", selected_crs)
+                QtWidgets.QMessageBox.information(
+                    self, "Settings", f"Default Export CRS set to:\n{selected_crs}"
+                )
 
 if __name__ == "__main__":
     app = QtWidgets.QApplication(sys.argv)

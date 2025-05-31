@@ -1,9 +1,3 @@
-"""
-Data Visualization Component (PyQt5 Version)
-
-Visualizes tree and log data parsed from StanForD PRI files.
-"""
-
 import logging
 from typing import Dict, List, Optional, Tuple
 
