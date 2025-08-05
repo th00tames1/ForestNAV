@@ -14,10 +14,25 @@ from PyQt5.QtWebEngineWidgets import QWebEngineView
 from PyQt5.QtCore import QSettings
 from collections import defaultdict
 import itertools
+from typing import Optional
 
 # Import custom modules
 from pri_parser import PRIParser
 from data_visualizer import DataVisualizer
+
+# ----- GNSS integration imports -----
+# CSV logging and timezone support for GNSS logging
+import csv
+from datetime import datetime
+# Attempt to import pytz for timezone support; fall back to None on failure
+try:
+    import pytz  # type: ignore
+except Exception:
+    pytz = None  # type: ignore
+
+# Import our PyQt5‑adapted GNSSManager and tile downloader
+from gnss_manager import GNSSManager
+from tile_downloader import download_tiles_multi_zoom
 
 # Configure logging
 logging.basicConfig(
@@ -197,6 +212,44 @@ class FileLoaderThread(QtCore.QThread):
         except Exception as e:
             import traceback
             logger.error(f"Error loading file: {e}\n{traceback.format_exc()}")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Additional worker thread for downloading map tiles
+#
+class TileDownloadThread(QtCore.QThread):
+    """Download OSM tiles in the background and report progress via signals.
+
+    This thread wraps the ``download_tiles_multi_zoom`` function and exposes
+    Qt signals for progress and status updates.  It accepts the bounding
+    box and a list of zoom levels at construction.
+    """
+    progressChanged = QtCore.pyqtSignal(int, int)
+    status = QtCore.pyqtSignal(str)
+    finished = QtCore.pyqtSignal()
+
+    def __init__(self, lat_min: float, lat_max: float, lon_min: float, lon_max: float, zoom_levels: list[int]):
+        super().__init__()
+        self.lat_min = lat_min
+        self.lat_max = lat_max
+        self.lon_min = lon_min
+        self.lon_max = lon_max
+        self.zoom_levels = zoom_levels
+
+    def run(self) -> None:
+        """Perform the tile download and emit progress/status signals."""
+        def callback(current: int, total: int) -> None:
+            self.progressChanged.emit(current, total)
+        try:
+            download_tiles_multi_zoom(
+                self.lat_min, self.lat_max, self.lon_min, self.lon_max,
+                self.zoom_levels, callback
+            )
+            self.status.emit("Tile download completed")
+        except Exception as e:
+            self.status.emit(f"Tile download error: {e}")
+        finally:
+            self.finished.emit()
 
 class ExportSettingsDialog(QtWidgets.QDialog):
     def __init__(self, parent=None):
@@ -428,14 +481,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self._init_tree_tab()
         self._init_log_tab()
         self._init_visualization_tab()
+        # Initialize the map tab before GNSS so that GNSS appears after map
         self._init_map_tab()  
-        
-        # 시그널 연결
+        # Initialize the GNSS tab (added for real-time GNSS functions)
+        self._init_gnss_tab()
+
+        # Connect signals for parser after all tabs are created
         self.parser.progressChanged.connect(self._update_progress)
         self.parser.parsingFinished.connect(self._on_parsing_finished)
+
+        # Initially enable only the Raw Data tab; keep GNSS tab enabled
         raw_idx = self.tab_control.indexOf(self.raw_data_tab)
+        gnss_idx = self.tab_control.indexOf(self.gnss_tab)
         for i in range(self.tab_control.count()):
-            if i != raw_idx:
+            if i != raw_idx and i != gnss_idx:
                 self.tab_control.setTabEnabled(i, False)
 
     def _init_summary_tab(self):
@@ -696,6 +755,308 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # 내보내기용 백업 (현재 파일만 우선 저장)
         self._map_df_for_export = self.tree_data
+
+    # ------------------------------------------------------------------
+    # GNSS tab helpers and callbacks
+    # ------------------------------------------------------------------
+    def _gnss_start(self) -> None:
+        """Start the GNSS reader using the selected serial port."""
+        port = self.gnss_port_edit.text().strip()
+        if not port:
+            QtWidgets.QMessageBox.warning(self, "GNSS", "Please enter a serial port to start GNSS.")
+            return
+        # Stop any existing manager
+        if self.gnss_manager is not None:
+            self.gnss_manager.stop()
+            self.gnss_manager = None
+        # Create and configure the manager
+        self.gnss_manager = GNSSManager(port)
+        self.gnss_manager.newDataAvailable.connect(self._on_new_gnss_data)
+        self.gnss_manager.status.connect(self._on_gnss_status)
+        self.gnss_manager.start()
+        # Update button states
+        self.gnss_start_btn.setEnabled(False)
+        self.gnss_stop_btn.setEnabled(True)
+        self.gnss_log_btn.setEnabled(True)
+        self.statusBar().showMessage(f"GNSS started on {port}")
+
+    def _gnss_stop(self) -> None:
+        """Stop the GNSS reader and disable logging."""
+        if self.gnss_manager is not None:
+            self.gnss_manager.stop()
+            self.gnss_manager = None
+        # If logging is active, stop it
+        if self.gnss_logging:
+            self._toggle_gnss_logging()
+        # Reset button states
+        self.gnss_start_btn.setEnabled(True)
+        self.gnss_stop_btn.setEnabled(False)
+        self.gnss_log_btn.setEnabled(False)
+        self.statusBar().showMessage("GNSS stopped")
+
+    def _on_gnss_status(self, msg: str) -> None:
+        """Display status messages from the GNSS manager."""
+        # Show GNSS status in the status bar and GNSS tab status label
+        self.statusBar().showMessage(msg)
+
+    def _on_new_gnss_data(self) -> None:
+        """Handle new GNSS data: update UI, map, and optionally log."""
+        if self.gnss_manager is None:
+            return
+        lat, lon, speed, bearing, fix = self.gnss_manager.get_latest_data()
+        # Update textual labels
+        self.gnss_lat_label.setText(f"{lat:.6f}" if lat is not None else "—")
+        self.gnss_lon_label.setText(f"{lon:.6f}" if lon is not None else "—")
+        self.gnss_speed_label.setText(f"{speed:.2f}" if speed is not None else "—")
+        self.gnss_bearing_label.setText(f"{bearing:.2f}" if bearing is not None else "—")
+        self.gnss_fix_label.setText(str(fix) if fix is not None else "—")
+        # Update map if lat/lon available
+        if lat is not None and lon is not None:
+            self._update_gnss_map(lat, lon)
+        # If logging is enabled, append a row
+        if self.gnss_logging and self.gnss_log_writer is not None:
+            # Determine timestamp in configured timezone
+            if self.gnss_tz:
+                dt = datetime.now(self.gnss_tz)
+            else:
+                dt = datetime.utcnow()
+            time_str = dt.strftime("%Y-%m-%d %H:%M:%S")
+            try:
+                self.gnss_log_writer.writerow([time_str, lat, lon, speed, bearing, fix])
+                self.gnss_log_file.flush()
+            except Exception:
+                pass
+
+    def _toggle_gnss_logging(self) -> None:
+        """Start or stop logging of GNSS data to a CSV file."""
+        if not self.gnss_logging:
+            # Begin logging: open a CSV file
+            if self.gnss_manager is None:
+                QtWidgets.QMessageBox.information(self, "GNSS Logging", "Please start GNSS before logging.")
+                return
+            # Compose filename with timestamp in Pacific timezone
+            if self.gnss_tz:
+                dt = datetime.now(self.gnss_tz)
+            else:
+                dt = datetime.utcnow()
+            fn = dt.strftime("gnss_log_%Y%m%d_%H%M%S.csv")
+            try:
+                self.gnss_log_file = open(fn, "w", newline="")
+                self.gnss_log_writer = csv.writer(self.gnss_log_file)
+                # Write header row
+                self.gnss_log_writer.writerow(["Time", "Latitude", "Longitude", "Speed_mps", "Bearing_deg", "Fix_Quality"])
+                self.gnss_logging = True
+                self.gnss_log_btn.setText("Stop Logging")
+                self.statusBar().showMessage(f"Logging GNSS data to {fn}")
+            except Exception as e:
+                QtWidgets.QMessageBox.critical(self, "Logging Error", f"Unable to open log file: {e}")
+        else:
+            # Stop logging
+            try:
+                if self.gnss_log_file:
+                    self.gnss_log_file.close()
+            except Exception:
+                pass
+            self.gnss_log_file = None
+            self.gnss_log_writer = None
+            self.gnss_logging = False
+            self.gnss_log_btn.setText("Start Logging")
+            self.statusBar().showMessage("GNSS logging stopped")
+
+    def _download_tiles(self) -> None:
+        """Parse input fields and start the tile download in a worker thread."""
+        try:
+            lat_min = float(self.tile_lat_min_edit.text().strip())
+            lat_max = float(self.tile_lat_max_edit.text().strip())
+            lon_min = float(self.tile_lon_min_edit.text().strip())
+            lon_max = float(self.tile_lon_max_edit.text().strip())
+        except ValueError:
+            QtWidgets.QMessageBox.warning(self, "Tile Downloader", "Please enter valid numeric latitude and longitude bounds.")
+            return
+        # Ensure lat_min <= lat_max and lon_min <= lon_max
+        if lat_min > lat_max:
+            lat_min, lat_max = lat_max, lat_min
+        if lon_min > lon_max:
+            lon_min, lon_max = lon_max, lon_min
+        # Parse zoom levels; allow comma‑separated integers
+        zoom_text = self.tile_zoom_levels_edit.text().strip()
+        if not zoom_text:
+            QtWidgets.QMessageBox.warning(self, "Tile Downloader", "Please specify at least one zoom level.")
+            return
+        zoom_levels = []
+        for z in zoom_text.split(','):
+            z = z.strip()
+            if not z:
+                continue
+            try:
+                zoom_levels.append(int(z))
+            except ValueError:
+                QtWidgets.QMessageBox.warning(self, "Tile Downloader", f"Invalid zoom level: {z}")
+                return
+        if not zoom_levels:
+            QtWidgets.QMessageBox.warning(self, "Tile Downloader", "No valid zoom levels specified.")
+            return
+        # Disable download button while downloading
+        self.tile_download_btn.setEnabled(False)
+        self.tile_progress_bar.setValue(0)
+        self.tile_status_label.setText("Starting download…")
+        # Create and start thread
+        self.tile_thread = TileDownloadThread(lat_min, lat_max, lon_min, lon_max, zoom_levels)
+        self.tile_thread.progressChanged.connect(self._on_tiles_progress)
+        self.tile_thread.status.connect(self._on_tiles_status)
+        self.tile_thread.finished.connect(self._on_tiles_finished)
+        self.tile_thread.start()
+
+    def _on_tiles_progress(self, current: int, total: int) -> None:
+        """Update progress bar based on tile download progress."""
+        if total > 0:
+            self.tile_progress_bar.setMaximum(total)
+            self.tile_progress_bar.setValue(current)
+
+    def _on_tiles_status(self, msg: str) -> None:
+        """Update the status label for tile download."""
+        self.tile_status_label.setText(msg)
+
+    def _on_tiles_finished(self) -> None:
+        """Re‑enable tile download button when finished."""
+        self.tile_download_btn.setEnabled(True)
+        # Clear thread reference
+        self.tile_thread = None
+
+    def _update_gnss_map(self, lat: Optional[float], lon: Optional[float]) -> None:
+        """Render a small map showing the current GNSS position and load it."""
+        try:
+            # If lat/lon are None render a blank map with message
+            if lat is None or lon is None:
+                m = folium.Map(location=[0, 0], zoom_start=1, tiles="OpenStreetMap")
+            else:
+                m = folium.Map(location=[lat, lon], zoom_start=18, tiles="OpenStreetMap")
+                folium.Marker([lat, lon], tooltip=f"{lat:.6f}, {lon:.6f}").add_to(m)
+            # Save to a temporary HTML file and display in the WebView
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".html")
+            m.save(tmp.name)
+            self.gnss_map_view.load(QtCore.QUrl.fromLocalFile(tmp.name))
+        except Exception:
+            pass
+
+    # ──────────────────────────────────────────────────────────────────────
+    # GNSS Tab
+    #
+    def _init_gnss_tab(self):
+        """Initialize the GNSS tab and set up widgets for real‑time GNSS."""
+        # Create tab and add it to the tab control
+        self.gnss_tab = QtWidgets.QWidget()
+        self.tab_control.addTab(self.gnss_tab, "GNSS")
+
+        # Root layout for GNSS tab
+        layout = QtWidgets.QVBoxLayout(self.gnss_tab)
+
+        # -----------------------------------------------------------------
+        # GNSS control group
+        ctrl_group = QtWidgets.QGroupBox("GNSS Control")
+        ctrl_layout = QtWidgets.QHBoxLayout(ctrl_group)
+
+        # Serial port input
+        self.gnss_port_edit = QtWidgets.QLineEdit()
+        self.gnss_port_edit.setPlaceholderText("Serial port (e.g., COM3 or /dev/ttyUSB0)")
+        ctrl_layout.addWidget(QtWidgets.QLabel("Port:"))
+        ctrl_layout.addWidget(self.gnss_port_edit)
+
+        # Start button
+        self.gnss_start_btn = QtWidgets.QPushButton("Start GNSS")
+        self.gnss_start_btn.clicked.connect(self._gnss_start)
+        ctrl_layout.addWidget(self.gnss_start_btn)
+
+        # Stop button
+        self.gnss_stop_btn = QtWidgets.QPushButton("Stop GNSS")
+        self.gnss_stop_btn.setEnabled(False)
+        self.gnss_stop_btn.clicked.connect(self._gnss_stop)
+        ctrl_layout.addWidget(self.gnss_stop_btn)
+
+        # Logging toggle button
+        self.gnss_log_btn = QtWidgets.QPushButton("Start Logging")
+        self.gnss_log_btn.setEnabled(False)
+        self.gnss_log_btn.clicked.connect(self._toggle_gnss_logging)
+        ctrl_layout.addWidget(self.gnss_log_btn)
+
+        # Add control group to layout
+        layout.addWidget(ctrl_group)
+
+        # -----------------------------------------------------------------
+        # GNSS data display group
+        data_group = QtWidgets.QGroupBox("GNSS Data")
+        data_layout = QtWidgets.QFormLayout(data_group)
+
+        # Create labels for each data field
+        self.gnss_lat_label = QtWidgets.QLabel("—")
+        self.gnss_lon_label = QtWidgets.QLabel("—")
+        self.gnss_speed_label = QtWidgets.QLabel("—")
+        self.gnss_bearing_label = QtWidgets.QLabel("—")
+        self.gnss_fix_label = QtWidgets.QLabel("—")
+
+        data_layout.addRow("Latitude:", self.gnss_lat_label)
+        data_layout.addRow("Longitude:", self.gnss_lon_label)
+        data_layout.addRow("Speed (m/s):", self.gnss_speed_label)
+        data_layout.addRow("Bearing (deg):", self.gnss_bearing_label)
+        data_layout.addRow("Fix quality:", self.gnss_fix_label)
+
+        layout.addWidget(data_group)
+
+        # -----------------------------------------------------------------
+        # GNSS map display group
+        map_group = QtWidgets.QGroupBox("GNSS Map")
+        map_layout = QtWidgets.QVBoxLayout(map_group)
+        # QWebEngineView to show the current position on a map
+        self.gnss_map_view = QWebEngineView()
+        map_layout.addWidget(self.gnss_map_view)
+        layout.addWidget(map_group)
+
+        # -----------------------------------------------------------------
+        # Tile downloader group
+        tile_group = QtWidgets.QGroupBox("Tile Downloader")
+        tile_layout = QtWidgets.QFormLayout(tile_group)
+        self.tile_lat_min_edit = QtWidgets.QLineEdit()
+        self.tile_lat_max_edit = QtWidgets.QLineEdit()
+        self.tile_lon_min_edit = QtWidgets.QLineEdit()
+        self.tile_lon_max_edit = QtWidgets.QLineEdit()
+        self.tile_zoom_levels_edit = QtWidgets.QLineEdit()
+        self.tile_zoom_levels_edit.setPlaceholderText("e.g. 15,16,17")
+        tile_layout.addRow("Lat min:", self.tile_lat_min_edit)
+        tile_layout.addRow("Lat max:", self.tile_lat_max_edit)
+        tile_layout.addRow("Lon min:", self.tile_lon_min_edit)
+        tile_layout.addRow("Lon max:", self.tile_lon_max_edit)
+        tile_layout.addRow("Zoom levels:", self.tile_zoom_levels_edit)
+        # Progress bar and status label
+        self.tile_progress_bar = QtWidgets.QProgressBar()
+        self.tile_status_label = QtWidgets.QLabel("")
+        tile_layout.addRow("Progress:", self.tile_progress_bar)
+        tile_layout.addRow("Status:", self.tile_status_label)
+        # Download button
+        self.tile_download_btn = QtWidgets.QPushButton("Download Tiles")
+        self.tile_download_btn.clicked.connect(self._download_tiles)
+        tile_layout.addRow(self.tile_download_btn)
+        layout.addWidget(tile_group)
+
+        # Initialise GNSS attributes
+        self.gnss_manager = None
+        self.gnss_logging = False
+        self.gnss_log_file = None  # file handle
+        self.gnss_log_writer = None  # csv writer
+        # Use Pacific timezone for logging; fallback to UTC if pytz missing
+        # Determine timezone for logging: if pytz is available, use US/Pacific; otherwise None
+        if pytz:
+            try:
+                self.gnss_tz = pytz.timezone('US/Pacific')  # type: ignore[attr-defined]
+            except Exception:
+                self.gnss_tz = None
+        else:
+            self.gnss_tz = None
+
+        # Tile download thread holder
+        self.tile_thread = None
+
+        # Set initial empty map
+        self._update_gnss_map(None, None)
 
     def _get_bin_params(self):
         try:

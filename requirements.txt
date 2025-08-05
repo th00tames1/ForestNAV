@@ -1,10 +1,16 @@
-chardet
+
+# Required Python packages for the integrated ForestNAV application
+PyQt5
+PyQtWebEngine
 folium
 geopandas
+shapely
 pandas
 numpy
 matplotlib
 seaborn
 fiona
-pyqt5
-PyQtWebEngine
+chardet
+pytz
+pyserial
+requests
