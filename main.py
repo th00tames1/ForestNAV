@@ -290,7 +290,7 @@ class MainWindow(QtWidgets.QMainWindow):
         super(MainWindow, self).__init__()
         self.tree_option_checkboxes = []
         self.log_option_checkboxes  = []
-        self.sw_version = "0.11"
+        self.sw_version = "0.12"
         self.setWindowTitle(f"ForestNAV {self.sw_version} - Advanced forestry Systems Lab, Oregon State University")
         icon_path = os.path.join(os.path.dirname(__file__), "icon.png")
         self.setWindowIcon(QtGui.QIcon(icon_path))
@@ -958,7 +958,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Serial port input
         self.gnss_port_edit = QtWidgets.QLineEdit()
-        self.gnss_port_edit.setPlaceholderText("Serial port (e.g., COM3 or /dev/ttyUSB0)")
+        self.gnss_port_edit.setPlaceholderText("Serial port (e.g., COM7 or /dev/ttyUSB0)")
         ctrl_layout.addWidget(QtWidgets.QLabel("Port:"))
         ctrl_layout.addWidget(self.gnss_port_edit)
 
@@ -1624,7 +1624,7 @@ class MainWindow(QtWidgets.QMainWindow):
         QtWidgets.QMessageBox.about(self, "About forestNAV", 
                                    "forestNAV - StanforD Harvester Head Data Analysis Tool\n"
                                    f"Version: {self.sw_version}\n"
-                                   "Heechan Jeong and Heesung Woo\n"
+                                   "Heechan Jeong, Taehyung Kim, and Heesung Woo\n"
                                    "Advanced forestry Systems Lab\n"
                                    "Oregon State University"
                                    )
