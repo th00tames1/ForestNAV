@@ -493,20 +493,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self._init_tree_tab()
         self._init_log_tab()
         self._init_visualization_tab()
-        # Initialize the map tab before GNSS so that GNSS appears after map
-        self._init_map_tab()  
-        # Initialize the GNSS tab (added for real-time GNSS functions)
-        self._init_gnss_tab()
+        # Initialize a single combined map/GNSS tab instead of separate Map and GNSS tabs.
+        # This unified tab will host the map along with GNSS controls and data display.
+        self._init_combined_tab()
 
         # Connect signals for parser after all tabs are created
         self.parser.progressChanged.connect(self._update_progress)
         self.parser.parsingFinished.connect(self._on_parsing_finished)
 
-        # Initially enable only the Raw Data tab; keep GNSS tab enabled
+        # Initially enable only the Raw Data tab and the unified Map tab.
+        # When combining the Map and GNSS functionality into a single tab
+        # (`self.map_tab`), the legacy `self.gnss_tab` attribute is no longer
+        # defined.  Instead, keep the unified map tab enabled alongside the
+        # raw data tab and disable all other tabs until a file is loaded.
         raw_idx = self.tab_control.indexOf(self.raw_data_tab)
-        gnss_idx = self.tab_control.indexOf(self.gnss_tab)
+        map_idx = self.tab_control.indexOf(self.map_tab)
         for i in range(self.tab_control.count()):
-            if i != raw_idx and i != gnss_idx:
+            if i != raw_idx and i != map_idx:
                 self.tab_control.setTabEnabled(i, False)
 
     def _init_summary_tab(self):
@@ -678,9 +681,287 @@ class MainWindow(QtWidgets.QMainWindow):
         self.map_msg.setAlignment(QtCore.Qt.AlignCenter)
         layout.addWidget(self.map_msg, 0, QtCore.Qt.AlignCenter)
 
+    def _init_combined_tab(self) -> None:
+        """Initialise a unified tab that combines map visualisation and GNSS features.
+
+        This method replaces the separate `_init_map_tab` and `_init_gnss_tab` methods.
+        It constructs a single tab that contains the GNSS control bar, GNSS data display,
+        a map view for both static datasets and real‑time GNSS updates, and a tile
+        downloader panel. A message label is included to indicate when no coordinate
+        data are available. The GNSS attributes and timezone settings are also
+        initialised here.
+        """
+        # Create the unified tab and add it to the tab control
+        self.map_tab = QtWidgets.QWidget()
+        self.tab_control.addTab(self.map_tab, "Map")
+
+        # Root layout for the unified tab
+        layout = QtWidgets.QVBoxLayout(self.map_tab)
+
+        # -----------------------------------------------------------------
+        # GNSS control group
+        ctrl_group = QtWidgets.QGroupBox("GNSS Control")
+        ctrl_layout = QtWidgets.QHBoxLayout(ctrl_group)
+        # Serial port selection: a drop‑down listing available serial ports
+        ctrl_layout.addWidget(QtWidgets.QLabel("Port:"))
+        self.gnss_port_combo = QtWidgets.QComboBox()
+        # Populate available ports at startup
+        self._refresh_serial_ports()
+        ctrl_layout.addWidget(self.gnss_port_combo)
+        # Button to refresh the list of serial ports
+        self.gnss_refresh_ports_btn = QtWidgets.QPushButton("Refresh")
+        self.gnss_refresh_ports_btn.setToolTip("Rescan available serial ports")
+        self.gnss_refresh_ports_btn.clicked.connect(self._refresh_serial_ports)
+        ctrl_layout.addWidget(self.gnss_refresh_ports_btn)
+        # Start/Stop toggle button.  This single button toggles GNSS on and off.
+        self.gnss_start_btn = QtWidgets.QPushButton("Connect")
+        self.gnss_start_btn.clicked.connect(self._toggle_gnss)
+        ctrl_layout.addWidget(self.gnss_start_btn)
+        # Logging toggle button
+        self.gnss_log_btn = QtWidgets.QPushButton("Start Logging")
+        self.gnss_log_btn.setEnabled(False)
+        self.gnss_log_btn.clicked.connect(self._toggle_gnss_logging)
+        ctrl_layout.addWidget(self.gnss_log_btn)
+        # Add control group to the unified layout
+        layout.addWidget(ctrl_group)
+
+        # -----------------------------------------------------------------
+        # GNSS data display group
+        data_group = QtWidgets.QGroupBox("GNSS Data")
+        data_layout = QtWidgets.QFormLayout(data_group)
+        # Create labels for each data field
+        self.gnss_lat_label = QtWidgets.QLabel("—")
+        self.gnss_lon_label = QtWidgets.QLabel("—")
+        self.gnss_speed_label = QtWidgets.QLabel("—")
+        self.gnss_bearing_label = QtWidgets.QLabel("—")
+        self.gnss_fix_label = QtWidgets.QLabel("—")
+        data_layout.addRow("Latitude:", self.gnss_lat_label)
+        data_layout.addRow("Longitude:", self.gnss_lon_label)
+        data_layout.addRow("Speed (m/s):", self.gnss_speed_label)
+        data_layout.addRow("Bearing (deg):", self.gnss_bearing_label)
+        data_layout.addRow("Fix quality:", self.gnss_fix_label)
+        layout.addWidget(data_group)
+
+        # -----------------------------------------------------------------
+        # Map display group
+        map_group = QtWidgets.QGroupBox("Map")
+        map_layout = QtWidgets.QVBoxLayout(map_group)
+        # Use a single QWebEngineView for both static datasets and GNSS updates
+        self.gnss_map_view = QWebEngineView()
+        map_layout.addWidget(self.gnss_map_view)
+        layout.addWidget(map_group)
+
+        # Label shown when no coordinate data are available
+        self.map_msg = QtWidgets.QLabel("No coordinate data available.")
+        self.map_msg.setAlignment(QtCore.Qt.AlignCenter)
+        layout.addWidget(self.map_msg, 0, QtCore.Qt.AlignCenter)
+
+        # -----------------------------------------------------------------
+        # Tile downloader group
+        tile_group = QtWidgets.QGroupBox("Tile Downloader")
+        tile_layout = QtWidgets.QFormLayout(tile_group)
+        # Latitude/Longitude inputs are no longer required; hide them
+        self.tile_lat_min_edit = QtWidgets.QLineEdit()
+        self.tile_lat_max_edit = QtWidgets.QLineEdit()
+        self.tile_lon_min_edit = QtWidgets.QLineEdit()
+        self.tile_lon_max_edit = QtWidgets.QLineEdit()
+        for w in (self.tile_lat_min_edit, self.tile_lat_max_edit,
+                  self.tile_lon_min_edit, self.tile_lon_max_edit):
+            w.setVisible(False)
+        # Predetermined zoom levels for tile download (0–18 inclusive)
+        self.tile_zoom_levels = list(range(0, 19))
+        # Progress bar and status label
+        self.tile_progress_bar = QtWidgets.QProgressBar()
+        self.tile_status_label = QtWidgets.QLabel("")
+        tile_layout.addRow("Progress:", self.tile_progress_bar)
+        tile_layout.addRow("Status:", self.tile_status_label)
+        # Download button
+        self.tile_download_btn = QtWidgets.QPushButton("Download Tiles")
+        # Connect to the handler that uses the map bounds
+        self.tile_download_btn.clicked.connect(self._download_tiles)
+        tile_layout.addRow(self.tile_download_btn)
+        layout.addWidget(tile_group)
+
+        # -----------------------------------------------------------------
+        # Initialise GNSS attributes
+        self.gnss_manager = None
+        self.gnss_logging = False
+        self.gnss_log_file = None  # file handle
+        self.gnss_log_writer = None  # csv writer
+        # Use Pacific timezone for logging; fallback to UTC if pytz missing
+        if pytz:
+            try:
+                self.gnss_tz = pytz.timezone('US/Pacific')  # type: ignore[attr-defined]
+            except Exception:
+                self.gnss_tz = None
+        else:
+            self.gnss_tz = None
+        # Tile download thread holder
+        self.tile_thread = None
+        # Initialise history for GNSS tracking
+        self.gnss_history = []
+
+        # -----------------------------------------------------------------
+        # Prepare and load the HTML template for the unified map.  This will
+        # render a Leaflet map and provide JS functions for updating the marker
+        # and adding dataset layers.  It also defines variables 'online' and
+        # 'offline' tile layers so they can be toggled after downloading tiles.
+        self._prepare_gnss_map_html()
+        # Ensure local file and remote URLs are permitted in the embedded view
+        settings = self.gnss_map_view.settings()
+        try:
+            # PyQt6 style: attributes nested under WebAttribute
+            settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
+            settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True)
+        except Exception:
+            try:
+                # PyQt5 style: attributes defined directly on QWebEngineSettings
+                settings.setAttribute(QWebEngineSettings.LocalContentCanAccessRemoteUrls, True)
+                settings.setAttribute(QWebEngineSettings.LocalContentCanAccessFileUrls, True)
+            except Exception:
+                pass
+        # Load the map
+        self.gnss_map_view.load(QtCore.QUrl.fromLocalFile(self.gnss_map_html_path))
+
     def _update_map_tab(self):
-        self.map_view.hide()
-        self.map_msg.show()
+        """Update the unified map tab with currently loaded datasets.
+
+        This implementation forwards dataset coordinates into the embedded Leaflet map
+        instead of regenerating a static Folium map.  Datasets are passed to the
+        JavaScript side via the `addDataset` function defined in the HTML
+        template.  Existing dataset layers are cleared before new layers are
+        added.  The map is centred on the mean of all coordinates.
+        """
+        # Gather datasets from the loaded files.  Each dataset consists of a
+        # label (file base name), a DataFrame of coordinates, and the full
+        # tree DataFrame.  Only files with both Latitude and Longitude columns
+        # and non‑empty coordinates are included.
+        datasets = []
+        for fp in getattr(self, 'fileLibrary', []):
+            cache = self.file_cache.get(fp)
+            if not cache or 'tree_data' not in cache:
+                continue
+            tdf = cache['tree_data']
+            if {"Latitude", "Longitude"} - set(tdf.columns):
+                continue
+            df_coords = (tdf[["Latitude", "Longitude"]]
+                         .dropna().astype(float)
+                         .reset_index(drop=False)
+                         .rename(columns={"index": "TreeID"}))
+            if df_coords.empty:
+                continue
+            datasets.append((os.path.basename(fp), df_coords, tdf))
+
+        # If no datasets are available, show a message and return without
+        # modifying the map.  This leaves any existing dataset layers intact.
+        if not datasets:
+            if hasattr(self, 'map_msg'):
+                self.map_msg.show()
+            return
+
+        # Hide the message label since data will be plotted
+        if hasattr(self, 'map_msg'):
+            self.map_msg.hide()
+
+        # Compute mean latitude and longitude across all datasets for centering
+        lat_mean = float(np.mean([d[1]["Latitude"].mean() for d in datasets]))
+        lon_mean = float(np.mean([d[1]["Longitude"].mean() for d in datasets]))
+
+        # Colour palette and cycling iterator for dataset layers
+        palette = [
+            "#e6194b", "#3cb44b", "#ffe119", "#4363d8", "#f58231",
+            "#911eb4", "#46f0f0", "#f032e6", "#bcf60c", "#fabebe",
+            "#008080", "#e6beff", "#9a6324", "#fffac8", "#800000",
+            "#aaffc3", "#808000", "#ffd8b1", "#000075", "#808080"
+        ]
+        color_cycle = itertools.cycle(palette)
+
+        # Clear existing dataset layers on the JavaScript side.  The clearDatasets()
+        # function is defined in the HTML template.  If it is not present, this
+        # call has no effect.
+        clear_js = "if (typeof clearDatasets === 'function') { clearDatasets(); }"
+        try:
+            self.gnss_map_view.page().runJavaScript(clear_js)
+        except Exception:
+            pass
+
+        # Add each dataset as a separate overlay layer.  For each dataset, build
+        # a list of [lat, lon] pairs and then invoke addDataset(name, points, color).
+        for label, df_coords, tdf in datasets:
+            # Use a detailed points list that includes info for popups/tooltips.
+            # Each element is [lat, lon, tooltip, popup].
+            color = next(color_cycle)
+            points = []
+            for r in df_coords.itertuples():
+                try:
+                    lat = float(r.Latitude)
+                    lon = float(r.Longitude)
+                except Exception:
+                    continue
+                # Tree index from the DataFrame row; use to lookup full tree info.
+                tree_idx = int(r.TreeID)
+                info_row = None
+                try:
+                    info_row = tdf.loc[tree_idx]
+                except Exception:
+                    info_row = None
+                # Tooltip uses the stem number if available, otherwise the tree index.
+                tooltip = None
+                if info_row is not None:
+                    try:
+                        stem = info_row.get('Tree ID (Stem Number)', None)
+                        if stem is not None and pd.notna(stem):
+                            tooltip = f"Tree ID (Stem Number): {stem}"
+                    except Exception:
+                        pass
+                if tooltip is None:
+                    tooltip = f"Tree {tree_idx}"
+                # Build an HTML popup string with all available attributes.
+                popup = None
+                if info_row is not None:
+                    try:
+                        popup_lines = []
+                        for k, v in info_row.items():
+                            try:
+                                if pd.notna(v):
+                                    popup_lines.append(f"<b>{k}</b>: {v}")
+                            except Exception:
+                                continue
+                        popup = "<br>".join(popup_lines)
+                    except Exception:
+                        popup = None
+                points.append([lat, lon, tooltip, popup])
+            # Serialise points to JSON for injection into JS.
+            try:
+                import json as _json
+                points_json = _json.dumps(points)
+            except Exception:
+                points_json = '[]'
+            js = (
+                f"if (typeof addDataset === 'function') "
+                f"{{ addDataset('{label}', {points_json}, '{color}'); }}"
+            )
+            try:
+                self.gnss_map_view.page().runJavaScript(js)
+            except Exception:
+                pass
+
+        # Centre the map on the computed mean location with a reasonable zoom level.
+        js_center = (
+            f"if (typeof map !== 'undefined' && map.setView) "
+            f"{{ map.setView([{lat_mean}, {lon_mean}], 16); }}"
+        )
+        try:
+            self.gnss_map_view.page().runJavaScript(js_center)
+        except Exception:
+            pass
+
+        # For export functionality, retain the last computed tree_data
+        self._map_df_for_export = getattr(self, 'tree_data', None)
+
+        # At this point the unified map has been updated; return early so that
+        # the original Folium-based implementation is skipped entirely.
+        return
 
         # ── 1) 데이터 모으기 ─────────────────────────────
         datasets = []
@@ -799,7 +1080,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.gnss_manager.status.connect(self._on_gnss_status)
         self.gnss_manager.start()
         # Update UI: change the toggle button text to indicate GNSS is running and enable logging
-        self.gnss_start_btn.setText("Stop GNSS")
+        self.gnss_start_btn.setText("Disconnect")
         self.gnss_start_btn.setEnabled(True)
         self.gnss_log_btn.setEnabled(True)
         self.statusBar().showMessage(f"GNSS started on {port}")
@@ -813,7 +1094,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.gnss_logging:
             self._toggle_gnss_logging()
         # Reset UI: revert the toggle button text and disable logging
-        self.gnss_start_btn.setText("Start GNSS")
+        self.gnss_start_btn.setText("Connect")
         self.gnss_start_btn.setEnabled(True)
         self.gnss_log_btn.setEnabled(False)
         self.statusBar().showMessage("GNSS stopped")
@@ -1100,7 +1381,7 @@ class MainWindow(QtWidgets.QMainWindow):
         ctrl_layout.addWidget(self.gnss_refresh_ports_btn)
 
         # Start/Stop toggle button.  This single button toggles GNSS on and off.
-        self.gnss_start_btn = QtWidgets.QPushButton("Start GNSS")
+        self.gnss_start_btn = QtWidgets.QPushButton("Connect")
         # Connect to the toggle handler rather than separate start/stop slots
         self.gnss_start_btn.clicked.connect(self._toggle_gnss)
         ctrl_layout.addWidget(self.gnss_start_btn)
@@ -1282,8 +1563,11 @@ class MainWindow(QtWidgets.QMainWindow):
   <script>
     // Initialize map and layers
     var map = L.map('map').setView([{lat0}, {lon0}], 2);
-    // Online OpenStreetMap layer
-    var online = L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{ maxZoom: 19, attribution: '© OpenStreetMap contributors' }}).addTo(map);
+    // Online satellite imagery layer (Esri World Imagery)
+    // Use Esri's World Imagery service as the default base map so users see satellite
+    // imagery instead of the standard OpenStreetMap tiles.  The curly braces are
+    // doubled to escape them in the Python f-string.
+    var online = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{{z}}/{{y}}/{{x}}', {{ maxZoom: 19, attribution: 'Tiles © Esri — Source: Esri, Maxar, Earthstar Geographics' }}).addTo(map);
     // Offline tile layer (not added by default)
     var offline = L.tileLayer('{tiles_path}/{{z}}/{{x}}/{{y}}.png', {{ maxZoom: 19, attribution: 'Offline tiles' }});
     // Current position marker
@@ -1293,6 +1577,73 @@ class MainWindow(QtWidgets.QMainWindow):
     // Whether the map should automatically center on the current position.
     // By default this is false; the user can toggle it via a custom control.
     var autoCenter = false;
+    // ---------------------------------------------------------------------
+    // Dataset layer storage and control.  The unified map needs to display
+    // static datasets loaded from files alongside the real‑time GNSS marker.
+    // Each dataset is stored in the `datasetLayers` object so that it can be
+    // removed or toggled via the Leaflet layer control.  A base layer
+    // dictionary defines the online and offline tile layers.
+    var datasetLayers = {{}};
+    var baseLayers = {{ 'Satellite': online, 'Offline': offline }};
+    // The controlLayers object will manage overlays for datasets.  The
+    // `collapsed: false` option keeps the control expanded by default.
+    var controlLayers = L.control.layers(baseLayers, {{}}, {{ collapsed: false }}).addTo(map);
+    /**
+     * Remove all previously added dataset layers from the map and the control.
+     * Called from Python before new datasets are added.
+     */
+    function clearDatasets() {{
+      for (var name in datasetLayers) {{
+        var layer = datasetLayers[name];
+        if (map.hasLayer(layer)) {{
+          map.removeLayer(layer);
+        }}
+        try {{
+          controlLayers.removeLayer(layer);
+        }} catch (e) {{
+          // ignore missing layer
+        }}
+      }}
+      datasetLayers = {{}};
+    }}
+    /**
+     * Add a new dataset to the map.
+     * @param {{string}} name  Dataset name to appear in the layer control
+     * @param {{Array}} points Array of [lat, lon, tooltip, popup] entries
+     * @param {{string}} color Hex colour code for markers
+     */
+    function addDataset(name, points, color) {{
+      // Use a feature group so that we can compute bounds when toggling layers.
+      var layer = L.featureGroup();
+      for (var i = 0; i < points.length; i++) {{
+        var pt = points[i];
+        var lat = pt[0], lon = pt[1];
+        var tooltip = (pt.length > 2 ? pt[2] : null);
+        var popup = (pt.length > 3 ? pt[3] : null);
+        var circle = L.circleMarker([lat, lon], {{ radius: 3, color: color, fillColor: color, fillOpacity: 0.8 }});
+        if (tooltip) {{
+          circle.bindTooltip(tooltip);
+        }}
+        if (popup) {{
+          circle.bindPopup(popup);
+        }}
+        circle.addTo(layer);
+      }}
+      layer.addTo(map);
+      datasetLayers[name] = layer;
+      controlLayers.addOverlay(layer, name);
+      // When the user toggles this overlay via the layer control, recenter the map
+      // on the bounds of the dataset.  Use the overlayadd event to detect when
+      // the layer is added to the map.
+      map.on('overlayadd', function(e) {{
+        if (e.layer === layer) {{
+          var b = layer.getBounds();
+          if (b && b.isValid && b.isValid()) {{
+            map.fitBounds(b);
+          }}
+        }}
+      }});
+    }}
     /**
      * Helper to move the main marker to a new location and optionally recenter the map.
      * @param {{number}} lat Latitude in decimal degrees
@@ -1342,7 +1693,8 @@ class MainWindow(QtWidgets.QMainWindow):
       button.href = '#';
       button.title = 'Toggle auto-center';
       // Use a simple icon for the button; Unicode target symbol
-      button.innerHTML = '&#9678;';
+      // Use a location pin icon for the auto-center button to make its purpose clearer.
+      button.innerHTML = '&#x1F4CD;';
       function updateStyle() {{
         if (autoCenter) {{
           L.DomUtil.addClass(button, 'active-center');
@@ -1577,22 +1929,34 @@ class MainWindow(QtWidgets.QMainWindow):
     def populate_all(self):
         try:
             max_len = max((len(pf.valueArr) for pf in self.openingFile), default=0)
-            # 딕셔너리 형태로 데이터 구성: {열 이름: 값 목록}
-            data = {}
+
+            matrix = []
+            cols   = []
             for pf in self.openingFile:
-                values = list(pf.valueArr)
-                if len(values) < max_len:
-                    values.extend([""] * (max_len - len(values)))
-                data[str(pf.number)] = values
+                arr = list(pf.valueArr)
+                # 패딩
+                if len(arr) < max_len:
+                    arr += [""] * (max_len - len(arr))
+                matrix.append(arr)
+                cols.append(str(pf.number))
 
-            df = pd.DataFrame(data)
+            df = pd.DataFrame(matrix).T
+            df.columns = cols
+
             self.df = df
-
             self.raw_data_table.setModel(PandasModel(self.df))
             self.raw_data_table.resizeColumnsToContents()
-            self.statusBar().showMessage(f"{self.df.shape[1]} columns × {self.df.shape[0]} rows loaded")
+            self.statusBar().showMessage(
+                f"{self.df.shape[1]} columns × {self.df.shape[0]} rows loaded"
+            )
+
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Error in populate_all", str(e))
+
+    # def analyze_file(self):
+    #     if not self.current_file: return
+    #     self.analyze_button.setEnabled(False); self.statusBar().showMessage("Analyzing…")
+    #     self.parser.parse_file(self.current_file)
     
     def analyze_file(self):
         """Library에 담긴 모든 PRI 파일을 차례로 분석한다."""

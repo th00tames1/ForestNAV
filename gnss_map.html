@@ -20,8 +20,11 @@
   <script>
     // Initialize map and layers
     var map = L.map('map').setView([0.0, 0.0], 2);
-    // Online OpenStreetMap layer
-    var online = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '© OpenStreetMap contributors' }).addTo(map);
+    // Online satellite imagery layer (Esri World Imagery)
+    // Use Esri's World Imagery service as the default base map so users see satellite
+    // imagery instead of the standard OpenStreetMap tiles.  The curly braces are
+    // doubled to escape them in the Python f-string.
+    var online = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', { maxZoom: 19, attribution: 'Tiles © Esri — Source: Esri, Maxar, Earthstar Geographics' }).addTo(map);
     // Offline tile layer (not added by default)
     var offline = L.tileLayer('tiles/{z}/{x}/{y}.png', { maxZoom: 19, attribution: 'Offline tiles' });
     // Current position marker
@@ -31,6 +34,73 @@
     // Whether the map should automatically center on the current position.
     // By default this is false; the user can toggle it via a custom control.
     var autoCenter = false;
+    // ---------------------------------------------------------------------
+    // Dataset layer storage and control.  The unified map needs to display
+    // static datasets loaded from files alongside the real‑time GNSS marker.
+    // Each dataset is stored in the `datasetLayers` object so that it can be
+    // removed or toggled via the Leaflet layer control.  A base layer
+    // dictionary defines the online and offline tile layers.
+    var datasetLayers = {};
+    var baseLayers = { 'Satellite': online, 'Offline': offline };
+    // The controlLayers object will manage overlays for datasets.  The
+    // `collapsed: false` option keeps the control expanded by default.
+    var controlLayers = L.control.layers(baseLayers, {}, { collapsed: false }).addTo(map);
+    /**
+     * Remove all previously added dataset layers from the map and the control.
+     * Called from Python before new datasets are added.
+     */
+    function clearDatasets() {
+      for (var name in datasetLayers) {
+        var layer = datasetLayers[name];
+        if (map.hasLayer(layer)) {
+          map.removeLayer(layer);
+        }
+        try {
+          controlLayers.removeLayer(layer);
+        } catch (e) {
+          // ignore missing layer
+        }
+      }
+      datasetLayers = {};
+    }
+    /**
+     * Add a new dataset to the map.
+     * @param {string} name  Dataset name to appear in the layer control
+     * @param {Array} points Array of [lat, lon, tooltip, popup] entries
+     * @param {string} color Hex colour code for markers
+     */
+    function addDataset(name, points, color) {
+      // Use a feature group so that we can compute bounds when toggling layers.
+      var layer = L.featureGroup();
+      for (var i = 0; i < points.length; i++) {
+        var pt = points[i];
+        var lat = pt[0], lon = pt[1];
+        var tooltip = (pt.length > 2 ? pt[2] : null);
+        var popup = (pt.length > 3 ? pt[3] : null);
+        var circle = L.circleMarker([lat, lon], { radius: 3, color: color, fillColor: color, fillOpacity: 0.8 });
+        if (tooltip) {
+          circle.bindTooltip(tooltip);
+        }
+        if (popup) {
+          circle.bindPopup(popup);
+        }
+        circle.addTo(layer);
+      }
+      layer.addTo(map);
+      datasetLayers[name] = layer;
+      controlLayers.addOverlay(layer, name);
+      // When the user toggles this overlay via the layer control, recenter the map
+      // on the bounds of the dataset.  Use the overlayadd event to detect when
+      // the layer is added to the map.
+      map.on('overlayadd', function(e) {
+        if (e.layer === layer) {
+          var b = layer.getBounds();
+          if (b && b.isValid && b.isValid()) {
+            map.fitBounds(b);
+          }
+        }
+      });
+    }
     /**
      * Helper to move the main marker to a new location and optionally recenter the map.
      * @param {number} lat Latitude in decimal degrees
@@ -80,7 +150,8 @@
       button.href = '#';
       button.title = 'Toggle auto-center';
       // Use a simple icon for the button; Unicode target symbol
-      button.innerHTML = '&#9678;';
+      // Use a location pin icon for the auto-center button to make its purpose clearer.
+      button.innerHTML = '&#x1F4CD;';
       function updateStyle() {
         if (autoCenter) {
           L.DomUtil.addClass(button, 'active-center');
