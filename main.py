@@ -1577,34 +1577,22 @@ class MainWindow(QtWidgets.QMainWindow):
     def populate_all(self):
         try:
             max_len = max((len(pf.valueArr) for pf in self.openingFile), default=0)
-
-            matrix = []
-            cols   = []
+            # 딕셔너리 형태로 데이터 구성: {열 이름: 값 목록}
+            data = {}
             for pf in self.openingFile:
-                arr = list(pf.valueArr)
-                # 패딩
-                if len(arr) < max_len:
-                    arr += [""] * (max_len - len(arr))
-                matrix.append(arr)
-                cols.append(str(pf.number))
+                values = list(pf.valueArr)
+                if len(values) < max_len:
+                    values.extend([""] * (max_len - len(values)))
+                data[str(pf.number)] = values
 
-            df = pd.DataFrame(matrix).T
-            df.columns = cols
-
+            df = pd.DataFrame(data)
             self.df = df
+
             self.raw_data_table.setModel(PandasModel(self.df))
             self.raw_data_table.resizeColumnsToContents()
-            self.statusBar().showMessage(
-                f"{self.df.shape[1]} columns × {self.df.shape[0]} rows loaded"
-            )
-
+            self.statusBar().showMessage(f"{self.df.shape[1]} columns × {self.df.shape[0]} rows loaded")
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Error in populate_all", str(e))
-
-    # def analyze_file(self):
-    #     if not self.current_file: return
-    #     self.analyze_button.setEnabled(False); self.statusBar().showMessage("Analyzing…")
-    #     self.parser.parse_file(self.current_file)
     
     def analyze_file(self):
         """Library에 담긴 모든 PRI 파일을 차례로 분석한다."""

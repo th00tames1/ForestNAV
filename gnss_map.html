@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>GNSS Map</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.7.1/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.7.1/dist/leaflet.js"></script>
+  <style>
+    html, body, #map { height: 100%; margin: 0; padding: 0; }
+    /* Style for the auto-center control when active */
+    .active-center {
+      background-color: #0078A8;
+      color: #fff;
+    }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <script>
+    // Initialize map and layers
+    var map = L.map('map').setView([0.0, 0.0], 2);
+    // Online OpenStreetMap layer
+    var online = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '© OpenStreetMap contributors' }).addTo(map);
+    // Offline tile layer (not added by default)
+    var offline = L.tileLayer('tiles/{z}/{x}/{y}.png', { maxZoom: 19, attribution: 'Offline tiles' });
+    // Current position marker
+    var marker = L.marker([0.0, 0.0]).addTo(map);
+    // History of visited points
+    var history = [];
+    // Whether the map should automatically center on the current position.
+    // By default this is false; the user can toggle it via a custom control.
+    var autoCenter = false;
+    /**
+     * Helper to move the main marker to a new location and optionally recenter the map.
+     * @param {number} lat Latitude in decimal degrees
+     * @param {number} lon Longitude in decimal degrees
+     */
+    function updateMarker(lat, lon) {
+      // Move the main marker
+      marker.setLatLng([lat, lon]);
+      // Recenter the map only if autoCenter is enabled
+      if (autoCenter) {
+        map.setView([lat, lon]);
+      }
+    }
+    /**
+     * Update the current position on the map and record it in the history.
+     * This calls updateMarker internally and adds a small circle marker for logging.
+     * @param {number} lat  Latitude in decimal degrees
+     * @param {number} lon  Longitude in decimal degrees
+     * @param {string} info Tooltip content shown when hovering over the history point
+     */
+    function updatePosition(lat, lon, info) {
+      // Always update the main marker and conditionally recenter
+      updateMarker(lat, lon);
+      // Create a small red circle at the given location
+      var pt = L.circleMarker([lat, lon], { radius: 4, color: 'red', fillColor: 'red', fillOpacity: 0.8 }).addTo(map);
+      if (info) {
+        // Attach a tooltip for hover display; tooltips show on mouseover by default
+        pt.bindTooltip(info);
+      }
+      history.push(pt);
+    }
+    /**
+     * Get current bounds of the map as [south, north, west, east].
+     */
+    function getBounds() {
+      var b = map.getBounds();
+      return [b.getSouth(), b.getNorth(), b.getWest(), b.getEast()].join(',');
+    }
+    /**
+     * Create a control button to toggle automatic centering on the user's position.
+     * The button is inactive by default.  Clicking it toggles autoCenter and updates its style.
+     */
+    var centerControl = L.control({position: 'topleft'});
+    centerControl.onAdd = function (map) {
+      var div = L.DomUtil.create('div', 'leaflet-bar leaflet-control');
+      var button = L.DomUtil.create('a', '', div);
+      button.href = '#';
+      button.title = 'Toggle auto-center';
+      // Use a simple icon for the button; Unicode target symbol
+      button.innerHTML = '&#9678;';
+      function updateStyle() {
+        if (autoCenter) {
+          L.DomUtil.addClass(button, 'active-center');
+        } else {
+          L.DomUtil.removeClass(button, 'active-center');
+        }
+      }
+      updateStyle();
+      L.DomEvent.on(button, 'click', L.DomEvent.stopPropagation)
+                .on(button, 'click', L.DomEvent.preventDefault)
+                .on(button, 'click', function() {
+                  autoCenter = !autoCenter;
+                  // If enabling, immediately recenter the map on the current marker location
+                  if (autoCenter) {
+                    var loc = marker.getLatLng();
+                    map.setView(loc);
+                  }
+                  updateStyle();
+                });
+      return div;
+    };
+    centerControl.addTo(map);
+  </script>
+</body>
+</html>

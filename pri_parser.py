@@ -189,60 +189,48 @@ class PRIParser(QtCore.QObject):
             self.tree_raw_data = []
             self.log_header = []
             self.log_raw_data = []
-            
-            self.file_info['file_name'] = os.path.basename(file_path)
-            self.file_info['file_size'] = os.path.getsize(file_path) / 1024  # KB
-            
+
+            self.file_info["file_name"] = os.path.basename(file_path)
+            self.file_info["file_size"] = os.path.getsize(file_path) / 1024  # KB
+
             with open(file_path, "rb") as f:
                 content = f.read()
 
-            detect = chardet.detect(content[:4000])
-            encoding = detect.get("encoding") or "utf-8"
-            try:
-                decoded_content = content.decode(encoding, errors="replace")
-            except Exception as e:
-                logger.error(f"Error decoding file: {e}")
-                self.parsingFinished.emit(False)
-                return False
-            
-            lines = decoded_content.split("~")
-            total_lines = len(lines)
-            
-            self.progressChanged.emit(0)
-            
-            for i, line in enumerate(lines):
-                if i % max(1, total_lines // 10) == 0:
-                    progress = (i / total_lines) * 100
-                    self.progressChanged.emit(progress)
+            # 앞부분만 사용해 인코딩을 추정
+            sample = content[:4000]
+            encoding = chardet.detect(sample).get("encoding") or "utf-8"
+            decoded_content = content.decode(encoding, errors="replace")
 
-                if not line.strip():
+            segments = decoded_content.split("~")
+            total = len(segments)
+            self.progressChanged.emit(0)
+
+            for i, segment in enumerate(segments):
+                if i % max(1, total // 10) == 0:
+                    self.progressChanged.emit((i / total) * 100)
+
+                segment = segment.strip()
+                if not segment:
                     continue
 
-                parts = line.split('~')
-                for part in parts:
-                    part = part.strip()
-                    if not part:
-                        continue
-                    
-                    tokens = part.split()
-                    if len(tokens) < 2:
-                        continue
-                    try:
-                        var = int(tokens[0])
-                        type_val = int(tokens[1])
-            
-                        if var in (256, 257, 266, 267):
-                            token_list = tokens[2:]
-                            if var == 256:
-                                self.log_header = token_list
-                            elif var == 257:
-                                self.log_raw_data.extend(token_list)
-                            elif var == 266:
-                                self.tree_header = token_list
-                            elif var == 267:
-                                self.tree_raw_data.extend(token_list)
-                    except (ValueError, IndexError):
-                        continue
+                tokens = segment.split()
+                if len(tokens) < 3:
+                    continue
+                try:
+                    var = int(tokens[0])
+                    type_val = int(tokens[1])
+                except ValueError:
+                    continue
+
+                token_list = tokens[2:]
+                if var == 256:
+                    self.log_header = token_list
+                elif var == 257:
+                    self.log_raw_data.extend(token_list)
+                elif var == 266:
+                    self.tree_header = token_list
+                elif var == 267:
+                    self.tree_raw_data.extend(token_list)
 
             self.progressChanged.emit(100)
             
