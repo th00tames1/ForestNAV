@@ -10,7 +10,7 @@ import seaborn as sns
 import logging
 import fiona
 from PyQt5 import QtWidgets, QtGui, QtCore
-from PyQt5.QtWebEngineWidgets import QWebEngineView
+from PyQt5.QtWebEngineWidgets import QWebEngineView, QWebEngineSettings
 from PyQt5.QtCore import QSettings
 from collections import defaultdict
 import itertools
@@ -33,6 +33,18 @@ except Exception:
 # Import our PyQt5‑adapted GNSSManager and tile downloader
 from gnss_manager import GNSSManager
 from tile_downloader import download_tiles_multi_zoom
+
+# Additional imports for GNSS improvements
+import json
+try:
+    # PySerial is used to enumerate serial ports.  We import both the
+    # top‑level ``serial`` package and its ``tools.list_ports`` submodule.
+    import serial  # type: ignore[attr-defined]
+    import serial.tools.list_ports  # type: ignore[attr-defined]
+except Exception:
+    # If pyserial is unavailable, set serial to None so that downstream code
+    # can gracefully handle the lack of port enumeration.
+    serial = None  # type: ignore
 
 # Configure logging
 logging.basicConfig(
@@ -761,9 +773,21 @@ class MainWindow(QtWidgets.QMainWindow):
     # ------------------------------------------------------------------
     def _gnss_start(self) -> None:
         """Start the GNSS reader using the selected serial port."""
-        port = self.gnss_port_edit.text().strip()
+        # Retrieve the selected serial port from the combo box.  The combo
+        # is editable, so the user may also type a custom port.  If no
+        # value is selected, warn the user.
+        if hasattr(self, 'gnss_port_combo'):
+            port = self.gnss_port_combo.currentText().strip()
+        else:
+            # Fallback to legacy line edit if combo is not present.  Guard
+            # against None since the legacy attribute may no longer exist.
+            port_edit = getattr(self, 'gnss_port_edit', None)
+            if port_edit is not None:
+                port = port_edit.text().strip()
+            else:
+                port = ''
         if not port:
-            QtWidgets.QMessageBox.warning(self, "GNSS", "Please enter a serial port to start GNSS.")
+            QtWidgets.QMessageBox.warning(self, "GNSS", "Please select or enter a serial port to start GNSS.")
             return
         # Stop any existing manager
         if self.gnss_manager is not None:
@@ -774,9 +798,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.gnss_manager.newDataAvailable.connect(self._on_new_gnss_data)
         self.gnss_manager.status.connect(self._on_gnss_status)
         self.gnss_manager.start()
-        # Update button states
-        self.gnss_start_btn.setEnabled(False)
-        self.gnss_stop_btn.setEnabled(True)
+        # Update UI: change the toggle button text to indicate GNSS is running and enable logging
+        self.gnss_start_btn.setText("Stop GNSS")
+        self.gnss_start_btn.setEnabled(True)
         self.gnss_log_btn.setEnabled(True)
         self.statusBar().showMessage(f"GNSS started on {port}")
 
@@ -788,11 +812,24 @@ class MainWindow(QtWidgets.QMainWindow):
         # If logging is active, stop it
         if self.gnss_logging:
             self._toggle_gnss_logging()
-        # Reset button states
+        # Reset UI: revert the toggle button text and disable logging
+        self.gnss_start_btn.setText("Start GNSS")
         self.gnss_start_btn.setEnabled(True)
-        self.gnss_stop_btn.setEnabled(False)
         self.gnss_log_btn.setEnabled(False)
         self.statusBar().showMessage("GNSS stopped")
+
+    def _toggle_gnss(self) -> None:
+        """Toggle the GNSS reader on or off using a single button.
+
+        When no GNSS manager exists, this calls :meth:`_gnss_start` to
+        initialise and start a new manager.  When a manager is present,
+        this stops it via :meth:`_gnss_stop`.  The button text and
+        enabled state are updated by those methods.
+        """
+        if self.gnss_manager is None:
+            self._gnss_start()
+        else:
+            self._gnss_stop()
 
     def _on_gnss_status(self, msg: str) -> None:
         """Display status messages from the GNSS manager."""
@@ -830,24 +867,36 @@ class MainWindow(QtWidgets.QMainWindow):
     def _toggle_gnss_logging(self) -> None:
         """Start or stop logging of GNSS data to a CSV file."""
         if not self.gnss_logging:
-            # Begin logging: open a CSV file
+            # Begin logging: prompt user to select a CSV file location
             if self.gnss_manager is None:
                 QtWidgets.QMessageBox.information(self, "GNSS Logging", "Please start GNSS before logging.")
                 return
-            # Compose filename with timestamp in Pacific timezone
+            # Suggest a default filename incorporating the current timestamp
             if self.gnss_tz:
                 dt = datetime.now(self.gnss_tz)
             else:
                 dt = datetime.utcnow()
-            fn = dt.strftime("gnss_log_%Y%m%d_%H%M%S.csv")
+            default_name = dt.strftime("gnss_log_%Y%m%d_%H%M%S.csv")
+            # Open a file save dialog
+            file_path, _ = QtWidgets.QFileDialog.getSaveFileName(
+                self,
+                "Select GNSS Log File",
+                default_name,
+                "CSV Files (*.csv)"
+            )
+            # If the user cancels the dialog, abort starting logging
+            if not file_path:
+                return
             try:
-                self.gnss_log_file = open(fn, "w", newline="")
+                # Open the selected file for writing and create a CSV writer
+                self.gnss_log_file = open(file_path, "w", newline="")
                 self.gnss_log_writer = csv.writer(self.gnss_log_file)
                 # Write header row
                 self.gnss_log_writer.writerow(["Time", "Latitude", "Longitude", "Speed_mps", "Bearing_deg", "Fix_Quality"])
+                # Update state and UI
                 self.gnss_logging = True
                 self.gnss_log_btn.setText("Stop Logging")
-                self.statusBar().showMessage(f"Logging GNSS data to {fn}")
+                self.statusBar().showMessage(f"Logging GNSS data to {file_path}")
             except Exception as e:
                 QtWidgets.QMessageBox.critical(self, "Logging Error", f"Unable to open log file: {e}")
         else:
@@ -864,48 +913,46 @@ class MainWindow(QtWidgets.QMainWindow):
             self.statusBar().showMessage("GNSS logging stopped")
 
     def _download_tiles(self) -> None:
-        """Parse input fields and start the tile download in a worker thread."""
-        try:
-            lat_min = float(self.tile_lat_min_edit.text().strip())
-            lat_max = float(self.tile_lat_max_edit.text().strip())
-            lon_min = float(self.tile_lon_min_edit.text().strip())
-            lon_max = float(self.tile_lon_max_edit.text().strip())
-        except ValueError:
-            QtWidgets.QMessageBox.warning(self, "Tile Downloader", "Please enter valid numeric latitude and longitude bounds.")
-            return
-        # Ensure lat_min <= lat_max and lon_min <= lon_max
-        if lat_min > lat_max:
-            lat_min, lat_max = lat_max, lat_min
-        if lon_min > lon_max:
-            lon_min, lon_max = lon_max, lon_min
-        # Parse zoom levels; allow comma‑separated integers
-        zoom_text = self.tile_zoom_levels_edit.text().strip()
-        if not zoom_text:
-            QtWidgets.QMessageBox.warning(self, "Tile Downloader", "Please specify at least one zoom level.")
-            return
-        zoom_levels = []
-        for z in zoom_text.split(','):
-            z = z.strip()
-            if not z:
-                continue
-            try:
-                zoom_levels.append(int(z))
-            except ValueError:
-                QtWidgets.QMessageBox.warning(self, "Tile Downloader", f"Invalid zoom level: {z}")
-                return
+        """Retrieve the visible map bounds and download tiles for the specified zoom levels.
+
+        Rather than requiring the user to manually enter latitude and longitude
+        bounds, this method queries the embedded Leaflet map for its current
+        bounding box.  The user only needs to specify one or more zoom levels
+        as a comma‑separated list.  Once the bounds are retrieved from the
+        JavaScript context, a background thread is started to download all
+        tiles covering the area for the requested zooms.
+        """
+        # Use predetermined zoom levels defined in _init_gnss_tab.  The user
+        # no longer enters zoom levels; if none are defined, abort.
+        zoom_levels: list[int] = getattr(self, 'tile_zoom_levels', [])
         if not zoom_levels:
-            QtWidgets.QMessageBox.warning(self, "Tile Downloader", "No valid zoom levels specified.")
+            QtWidgets.QMessageBox.warning(self, "Tile Downloader", "No zoom levels defined for download.")
             return
-        # Disable download button while downloading
+        # Disable the download button and reset progress
         self.tile_download_btn.setEnabled(False)
         self.tile_progress_bar.setValue(0)
-        self.tile_status_label.setText("Starting download…")
-        # Create and start thread
-        self.tile_thread = TileDownloadThread(lat_min, lat_max, lon_min, lon_max, zoom_levels)
-        self.tile_thread.progressChanged.connect(self._on_tiles_progress)
-        self.tile_thread.status.connect(self._on_tiles_status)
-        self.tile_thread.finished.connect(self._on_tiles_finished)
-        self.tile_thread.start()
+        self.tile_status_label.setText("Retrieving map bounds…")
+        # JavaScript to compute map bounds: returns "south,north,west,east"
+        js = """
+            (function() {
+                if (typeof getBounds === 'function') {
+                    return getBounds();
+                } else {
+                    var b = map.getBounds();
+                    return [b.getSouth(), b.getNorth(), b.getWest(), b.getEast()].join(',');
+                }
+            })();
+        """
+        # Capture zoom_levels for the callback
+        def bounds_callback(bbox_str: str) -> None:
+            self._on_tiles_bounds_received(bbox_str, zoom_levels)
+        # Invoke the JavaScript on the map view
+        try:
+            self.gnss_map_view.page().runJavaScript(js, bounds_callback)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Tile Downloader", f"Failed to retrieve map bounds: {e}")
+            # Re‑enable the button since we didn't start downloading
+            self.tile_download_btn.setEnabled(True)
 
     def _on_tiles_progress(self, current: int, total: int) -> None:
         """Update progress bar based on tile download progress."""
@@ -918,26 +965,106 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tile_status_label.setText(msg)
 
     def _on_tiles_finished(self) -> None:
-        """Re‑enable tile download button when finished."""
+        """Handle completion of tile downloads.
+
+        Re‑enable the tile download button, clear the thread reference and
+        attempt to swap the map layers so that downloaded offline tiles
+        are used instead of the online OpenStreetMap layer.  This is
+        accomplished by reloading the map view and executing a small
+        JavaScript snippet that removes the online layer and adds the
+        offline layer.
+        """
         self.tile_download_btn.setEnabled(True)
         # Clear thread reference
         self.tile_thread = None
+        # Reload the view to ensure any new tiles are picked up
+        try:
+            self.gnss_map_view.reload()
+            # Toggle layers: remove online if present and add offline if absent
+            js = """
+                (function() {
+                    if (typeof online !== 'undefined' && map.hasLayer(online)) {
+                        map.removeLayer(online);
+                    }
+                    if (typeof offline !== 'undefined' && !map.hasLayer(offline)) {
+                        map.addLayer(offline);
+                    }
+                })();
+            """
+            # Delay execution slightly to allow map to reload
+            QtCore.QTimer.singleShot(500, lambda: self.gnss_map_view.page().runJavaScript(js))
+        except Exception as e:
+            logger.error(f"Error toggling offline map layer: {e}")
+
+    def _on_tiles_bounds_received(self, bbox_str: str, zoom_levels: list[int]) -> None:
+        """Callback invoked with the map bounds string and zoom levels.
+
+        This method parses the bounding box returned from the JavaScript
+        function, validates numeric values, starts the background tile
+        download thread and connects its signals to update the UI.
+
+        Parameters
+        ----------
+        bbox_str : str
+            A comma‑separated string containing south, north, west, east.
+        zoom_levels : list[int]
+            List of integer zoom levels to download.
+        """
+        try:
+            south, north, west, east = [float(x) for x in bbox_str.split(',')]
+        except Exception:
+            QtWidgets.QMessageBox.critical(self, "Tile Downloader", "Failed to parse map bounds from viewer.")
+            self.tile_download_btn.setEnabled(True)
+            return
+        # Normalise values so that lat_min <= lat_max and lon_min <= lon_max
+        lat_min, lat_max = sorted([south, north])
+        lon_min, lon_max = sorted([west, east])
+        # Update status and reset progress bar
+        self.tile_progress_bar.setValue(0)
+        self.tile_status_label.setText("Starting download…")
+        # Start the download thread
+        self.tile_thread = TileDownloadThread(lat_min, lat_max, lon_min, lon_max, zoom_levels)
+        self.tile_thread.progressChanged.connect(self._on_tiles_progress)
+        self.tile_thread.status.connect(self._on_tiles_status)
+        self.tile_thread.finished.connect(self._on_tiles_finished)
+        self.tile_thread.start()
 
     def _update_gnss_map(self, lat: Optional[float], lon: Optional[float]) -> None:
-        """Render a small map showing the current GNSS position and load it."""
+        """Update the GNSS map with the latest position.
+
+        Instead of regenerating the map for every update, this method
+        communicates with the embedded Leaflet map via JavaScript.  It
+        calls the ``updatePosition`` function defined in the HTML to
+        move the main marker, center the view and add a new circle
+        marker for the current fix.  A history of fixes is maintained
+        so that each point receives a unique index and timestamp.  If
+        no position is provided, the map is not updated.
+        """
+        # Do nothing when no valid coordinates are provided
+        if lat is None or lon is None:
+            return
         try:
-            # If lat/lon are None render a blank map with message
-            if lat is None or lon is None:
-                m = folium.Map(location=[0, 0], zoom_start=1, tiles="OpenStreetMap")
-            else:
-                m = folium.Map(location=[lat, lon], zoom_start=18, tiles="OpenStreetMap")
-                folium.Marker([lat, lon], tooltip=f"{lat:.6f}, {lon:.6f}").add_to(m)
-            # Save to a temporary HTML file and display in the WebView
-            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".html")
-            m.save(tmp.name)
-            self.gnss_map_view.load(QtCore.QUrl.fromLocalFile(tmp.name))
-        except Exception:
-            pass
+            # Always update the main marker to the latest position.
+            js_marker = f"updateMarker({lat}, {lon});"
+            self.gnss_map_view.page().runJavaScript(js_marker)
+            # Only record and draw history points when logging is enabled
+            if self.gnss_logging:
+                # Compose tooltip information including an incrementing ID, timestamp and coordinates
+                idx = len(self.gnss_history) + 1
+                # Determine timestamp in configured timezone (Pacific by default) or UTC
+                if self.gnss_tz:
+                    dt = datetime.now(self.gnss_tz)
+                else:
+                    dt = datetime.utcnow()
+                ts_str = dt.strftime("%Y-%m-%d %H:%M:%S")
+                info = f"#{idx}<br>Time: {ts_str}<br>Lat: {lat:.6f}<br>Lon: {lon:.6f}"
+                info_json = json.dumps(info)
+                js_point = f"updatePosition({lat}, {lon}, {info_json});"
+                self.gnss_map_view.page().runJavaScript(js_point)
+                # Append to Python-side history for indexing
+                self.gnss_history.append((lat, lon, ts_str))
+        except Exception as e:
+            logger.error(f"Failed to update GNSS map: {e}")
 
     # ──────────────────────────────────────────────────────────────────────
     # GNSS Tab
@@ -956,22 +1083,27 @@ class MainWindow(QtWidgets.QMainWindow):
         ctrl_group = QtWidgets.QGroupBox("GNSS Control")
         ctrl_layout = QtWidgets.QHBoxLayout(ctrl_group)
 
-        # Serial port input
-        self.gnss_port_edit = QtWidgets.QLineEdit()
-        self.gnss_port_edit.setPlaceholderText("Serial port (e.g., COM7 or /dev/ttyUSB0)")
+        # Serial port selection
+        # Replace the manual text entry with a drop‑down listing available serial ports.
         ctrl_layout.addWidget(QtWidgets.QLabel("Port:"))
-        ctrl_layout.addWidget(self.gnss_port_edit)
+        self.gnss_port_combo = QtWidgets.QComboBox()
+        # Populate available ports at startup
+        self._refresh_serial_ports()
+        # Allow the user to refresh the list by clicking the drop‑down arrow
+        ctrl_layout.addWidget(self.gnss_port_combo)
+        # Maintain a legacy attribute for backward compatibility; unused now
+        self.gnss_port_edit = None
+        # Optional: add a button to refresh ports manually
+        self.gnss_refresh_ports_btn = QtWidgets.QPushButton("Refresh")
+        self.gnss_refresh_ports_btn.setToolTip("Rescan available serial ports")
+        self.gnss_refresh_ports_btn.clicked.connect(self._refresh_serial_ports)
+        ctrl_layout.addWidget(self.gnss_refresh_ports_btn)
 
-        # Start button
+        # Start/Stop toggle button.  This single button toggles GNSS on and off.
         self.gnss_start_btn = QtWidgets.QPushButton("Start GNSS")
-        self.gnss_start_btn.clicked.connect(self._gnss_start)
+        # Connect to the toggle handler rather than separate start/stop slots
+        self.gnss_start_btn.clicked.connect(self._toggle_gnss)
         ctrl_layout.addWidget(self.gnss_start_btn)
-
-        # Stop button
-        self.gnss_stop_btn = QtWidgets.QPushButton("Stop GNSS")
-        self.gnss_stop_btn.setEnabled(False)
-        self.gnss_stop_btn.clicked.connect(self._gnss_stop)
-        ctrl_layout.addWidget(self.gnss_stop_btn)
 
         # Logging toggle button
         self.gnss_log_btn = QtWidgets.QPushButton("Start Logging")
@@ -1015,17 +1147,18 @@ class MainWindow(QtWidgets.QMainWindow):
         # Tile downloader group
         tile_group = QtWidgets.QGroupBox("Tile Downloader")
         tile_layout = QtWidgets.QFormLayout(tile_group)
+        # Latitude/Longitude inputs are no longer required; hide them but keep the zoom level input
         self.tile_lat_min_edit = QtWidgets.QLineEdit()
         self.tile_lat_max_edit = QtWidgets.QLineEdit()
         self.tile_lon_min_edit = QtWidgets.QLineEdit()
         self.tile_lon_max_edit = QtWidgets.QLineEdit()
-        self.tile_zoom_levels_edit = QtWidgets.QLineEdit()
-        self.tile_zoom_levels_edit.setPlaceholderText("e.g. 15,16,17")
-        tile_layout.addRow("Lat min:", self.tile_lat_min_edit)
-        tile_layout.addRow("Lat max:", self.tile_lat_max_edit)
-        tile_layout.addRow("Lon min:", self.tile_lon_min_edit)
-        tile_layout.addRow("Lon max:", self.tile_lon_max_edit)
-        tile_layout.addRow("Zoom levels:", self.tile_zoom_levels_edit)
+        # Hide these fields since the bounding box will be taken from the map
+        for w in (self.tile_lat_min_edit, self.tile_lat_max_edit, self.tile_lon_min_edit, self.tile_lon_max_edit):
+            w.setVisible(False)
+        # Predetermined zoom levels for tile download.  The user no longer
+        # selects zoom levels manually; instead we download a reasonable
+        # range of zooms (0–18 inclusive) as in the original GNSS viewer.
+        self.tile_zoom_levels = list(range(0, 19))
         # Progress bar and status label
         self.tile_progress_bar = QtWidgets.QProgressBar()
         self.tile_status_label = QtWidgets.QLabel("")
@@ -1033,6 +1166,7 @@ class MainWindow(QtWidgets.QMainWindow):
         tile_layout.addRow("Status:", self.tile_status_label)
         # Download button
         self.tile_download_btn = QtWidgets.QPushButton("Download Tiles")
+        # Connect to our new download handler that uses the map bounds
         self.tile_download_btn.clicked.connect(self._download_tiles)
         tile_layout.addRow(self.tile_download_btn)
         layout.addWidget(tile_group)
@@ -1055,8 +1189,194 @@ class MainWindow(QtWidgets.QMainWindow):
         # Tile download thread holder
         self.tile_thread = None
 
-        # Set initial empty map
-        self._update_gnss_map(None, None)
+        # Initialise history for GNSS tracking
+        self.gnss_history = []
+
+        # Prepare and load the HTML template for the GNSS map.  This will render
+        # a Leaflet map and provide JS functions for updating the marker and
+        # retrieving the current map bounds.  It also defines variables
+        # 'online' and 'offline' tile layers so they can be toggled after
+        # downloading tiles.
+        self._prepare_gnss_map_html()
+        # Ensure local file and remote URLs are permitted in the embedded view
+        settings = self.gnss_map_view.settings()
+        # Enable access to both remote and local content from file:// URLs.  The
+        # attribute names differ between PyQt5 and PyQt6; attempt both.
+        try:
+            # PyQt6 style: attributes nested under WebAttribute
+            settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
+            settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True)
+        except Exception:
+            try:
+                # PyQt5 style: attributes defined directly on QWebEngineSettings
+                settings.setAttribute(QWebEngineSettings.LocalContentCanAccessRemoteUrls, True)
+                settings.setAttribute(QWebEngineSettings.LocalContentCanAccessFileUrls, True)
+            except Exception:
+                pass
+        # Load the map
+        self.gnss_map_view.load(QtCore.QUrl.fromLocalFile(self.gnss_map_html_path))
+
+    # ------------------------------------------------------------------
+    # GNSS helper methods
+    # ------------------------------------------------------------------
+    def _refresh_serial_ports(self) -> None:
+        """Populate the serial port combo box with available ports.
+
+        This uses the serial.tools.list_ports API if available.  If
+        pyserial is not installed, the combo will remain empty.
+        """
+        if not hasattr(self, 'gnss_port_combo'):
+            return
+        self.gnss_port_combo.clear()
+        if serial:
+            try:
+                ports = list(serial.tools.list_ports.comports())
+            except Exception:
+                ports = []
+            for p in ports:
+                # Add the device identifier (e.g. COM5 or /dev/ttyUSB0)
+                self.gnss_port_combo.addItem(p.device)
+        # Always allow manual entry by making the combo editable
+        self.gnss_port_combo.setEditable(True)
+
+    def _prepare_gnss_map_html(self) -> None:
+        """Generate or update the HTML used to render the GNSS map.
+
+        The HTML includes a Leaflet map with both online and offline tile
+        layers defined.  It also defines a marker for the current GNSS
+        position, a history array to store past points, and functions
+        updatePosition(lat, lon, info) to move the marker and add
+        history points, and getBounds() to return the current map
+        bounds.  The file is written to a persistent location in the
+        application directory so that relative paths to the tiles
+        directory remain valid.
+        """
+        # Determine where to write the HTML.  Put it alongside this script
+        base_dir = os.path.abspath(os.path.dirname(__file__))
+        html_path = os.path.join(base_dir, 'gnss_map.html')
+        # Starting position placeholder (center of world)
+        lat0 = 0.0
+        lon0 = 0.0
+        # Compute relative path from HTML to tiles directory
+        tiles_path = 'tiles'
+        # Build the HTML content
+        html = f"""<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>GNSS Map</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.7.1/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.7.1/dist/leaflet.js"></script>
+  <style>
+    html, body, #map {{ height: 100%; margin: 0; padding: 0; }}
+    /* Style for the auto-center control when active */
+    .active-center {{
+      background-color: #0078A8;
+      color: #fff;
+    }}
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <script>
+    // Initialize map and layers
+    var map = L.map('map').setView([{lat0}, {lon0}], 2);
+    // Online OpenStreetMap layer
+    var online = L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{ maxZoom: 19, attribution: '© OpenStreetMap contributors' }}).addTo(map);
+    // Offline tile layer (not added by default)
+    var offline = L.tileLayer('{tiles_path}/{{z}}/{{x}}/{{y}}.png', {{ maxZoom: 19, attribution: 'Offline tiles' }});
+    // Current position marker
+    var marker = L.marker([{lat0}, {lon0}]).addTo(map);
+    // History of visited points
+    var history = [];
+    // Whether the map should automatically center on the current position.
+    // By default this is false; the user can toggle it via a custom control.
+    var autoCenter = false;
+    /**
+     * Helper to move the main marker to a new location and optionally recenter the map.
+     * @param {{number}} lat Latitude in decimal degrees
+     * @param {{number}} lon Longitude in decimal degrees
+     */
+    function updateMarker(lat, lon) {{
+      // Move the main marker
+      marker.setLatLng([lat, lon]);
+      // Recenter the map only if autoCenter is enabled
+      if (autoCenter) {{
+        map.setView([lat, lon]);
+      }}
+    }}
+    /**
+     * Update the current position on the map and record it in the history.
+     * This calls updateMarker internally and adds a small circle marker for logging.
+     * @param {{number}} lat  Latitude in decimal degrees
+     * @param {{number}} lon  Longitude in decimal degrees
+     * @param {{string}} info Tooltip content shown when hovering over the history point
+     */
+    function updatePosition(lat, lon, info) {{
+      // Always update the main marker and conditionally recenter
+      updateMarker(lat, lon);
+      // Create a small red circle at the given location
+      var pt = L.circleMarker([lat, lon], {{ radius: 4, color: 'red', fillColor: 'red', fillOpacity: 0.8 }}).addTo(map);
+      if (info) {{
+        // Attach a tooltip for hover display; tooltips show on mouseover by default
+        pt.bindTooltip(info);
+      }}
+      history.push(pt);
+    }}
+    /**
+     * Get current bounds of the map as [south, north, west, east].
+     */
+    function getBounds() {{
+      var b = map.getBounds();
+      return [b.getSouth(), b.getNorth(), b.getWest(), b.getEast()].join(',');
+    }}
+    /**
+     * Create a control button to toggle automatic centering on the user's position.
+     * The button is inactive by default.  Clicking it toggles autoCenter and updates its style.
+     */
+    var centerControl = L.control({{position: 'topleft'}});
+    centerControl.onAdd = function (map) {{
+      var div = L.DomUtil.create('div', 'leaflet-bar leaflet-control');
+      var button = L.DomUtil.create('a', '', div);
+      button.href = '#';
+      button.title = 'Toggle auto-center';
+      // Use a simple icon for the button; Unicode target symbol
+      button.innerHTML = '&#9678;';
+      function updateStyle() {{
+        if (autoCenter) {{
+          L.DomUtil.addClass(button, 'active-center');
+        }} else {{
+          L.DomUtil.removeClass(button, 'active-center');
+        }}
+      }}
+      updateStyle();
+      L.DomEvent.on(button, 'click', L.DomEvent.stopPropagation)
+                .on(button, 'click', L.DomEvent.preventDefault)
+                .on(button, 'click', function() {{
+                  autoCenter = !autoCenter;
+                  // If enabling, immediately recenter the map on the current marker location
+                  if (autoCenter) {{
+                    var loc = marker.getLatLng();
+                    map.setView(loc);
+                  }}
+                  updateStyle();
+                }});
+      return div;
+    }};
+    centerControl.addTo(map);
+  </script>
+</body>
+</html>
+"""
+        # Write the HTML to disk
+        try:
+            with open(html_path, 'w', encoding='utf-8') as f:
+                f.write(html)
+        except Exception as e:
+            logger.error(f"Failed to write GNSS map HTML: {e}")
+        # Store path for later loading
+        self.gnss_map_html_path = html_path
 
     def _get_bin_params(self):
         try:
