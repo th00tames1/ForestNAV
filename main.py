@@ -248,19 +248,47 @@ class TileDownloadThread(QtCore.QThread):
         self.lon_max = lon_max
         self.zoom_levels = zoom_levels
 
+        # Internal flag used to request cancellation.  The download loop in
+        # ``download_tiles_multi_zoom`` will periodically call a supplied
+        # callback to check this flag and exit early if it returns True.
+        self._cancelled: bool = False
+
+    def cancel(self) -> None:
+        """Request cancellation of the current download.
+
+        The download loop periodically checks this flag and will exit early
+        when set.  This method is thread‑safe and may be called from the
+        main GUI thread.
+        """
+        self._cancelled = True
+
     def run(self) -> None:
         """Perform the tile download and emit progress/status signals."""
         def callback(current: int, total: int) -> None:
             self.progressChanged.emit(current, total)
+        # Provide a cancellation callback to the downloader.  It will be called
+        # before fetching each tile.  When True is returned the download stops.
+        cancel_cb = lambda: self._cancelled
         try:
             download_tiles_multi_zoom(
-                self.lat_min, self.lat_max, self.lon_min, self.lon_max,
-                self.zoom_levels, callback
+                self.lat_min,
+                self.lat_max,
+                self.lon_min,
+                self.lon_max,
+                self.zoom_levels,
+                callback,
+                cancel_callback=cancel_cb,
             )
-            self.status.emit("Tile download completed")
+            # Determine whether the operation was cancelled and emit an appropriate status.
+            if self._cancelled:
+                self.status.emit("Tile download cancelled")
+            else:
+                self.status.emit("Tile download completed")
         except Exception as e:
+            # Forward any unexpected errors to the status signal.
             self.status.emit(f"Tile download error: {e}")
         finally:
+            # Always emit the finished signal to notify the GUI that the thread is done.
             self.finished.emit()
 
 class ExportSettingsDialog(QtWidgets.QDialog):
@@ -1258,6 +1286,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tile_download_btn.setEnabled(True)
         # Clear thread reference
         self.tile_thread = None
+        # Disable the cancel button now that the thread is done
+        try:
+            if hasattr(self, 'tile_cancel_btn'):
+                self.tile_cancel_btn.setEnabled(False)
+        except Exception:
+            pass
         # Reload the view to ensure any new tiles are picked up
         try:
             self.gnss_map_view.reload()
@@ -1276,6 +1310,37 @@ class MainWindow(QtWidgets.QMainWindow):
             QtCore.QTimer.singleShot(500, lambda: self.gnss_map_view.page().runJavaScript(js))
         except Exception as e:
             logger.error(f"Error toggling offline map layer: {e}")
+
+    def _cancel_tile_download(self) -> None:
+        """Handle user request to cancel the tile download.
+
+        If a download thread is running, mark it as cancelled.  This will cause
+        the thread to exit early on its next iteration.  Immediately re‑enable
+        the download button and disable the cancel button.  Update the status
+        label to inform the user that cancellation has been requested.
+        """
+        try:
+            if getattr(self, 'tile_thread', None):
+                # Request cancellation.  The thread periodically checks this flag.
+                try:
+                    self.tile_thread.cancel()
+                except Exception:
+                    pass
+                # Provide immediate UI feedback
+                self.tile_status_label.setText("Cancelling…")
+        except Exception:
+            pass
+        # Re‑enable the download button so the user can start a new download if desired.
+        try:
+            self.tile_download_btn.setEnabled(True)
+        except Exception:
+            pass
+        # Disable the cancel button to prevent duplicate cancellation attempts.
+        try:
+            if hasattr(self, 'tile_cancel_btn'):
+                self.tile_cancel_btn.setEnabled(False)
+        except Exception:
+            pass
 
     def _on_tiles_bounds_received(self, bbox_str: str, zoom_levels: list[int]) -> None:
         """Callback invoked with the map bounds string and zoom levels.
@@ -1309,6 +1374,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tile_thread.status.connect(self._on_tiles_status)
         self.tile_thread.finished.connect(self._on_tiles_finished)
         self.tile_thread.start()
+        # Enable the cancel button since a download is now running
+        try:
+            if hasattr(self, 'tile_cancel_btn'):
+                self.tile_cancel_btn.setEnabled(True)
+        except Exception:
+            pass
 
     def _update_gnss_map(self, lat: Optional[float], lon: Optional[float]) -> None:
         """Update the GNSS map with the latest position.
@@ -1447,10 +1518,35 @@ class MainWindow(QtWidgets.QMainWindow):
         tile_layout.addRow("Status:", self.tile_status_label)
         # Download button
         self.tile_download_btn = QtWidgets.QPushButton("Download Tiles")
+        # Cancel button for aborting an in‑progress download
+        self.tile_cancel_btn = QtWidgets.QPushButton("Cancel")
+        # Disable the cancel button until a download is started
+        self.tile_cancel_btn.setEnabled(False)
         # Connect to our new download handler that uses the map bounds
         self.tile_download_btn.clicked.connect(self._download_tiles)
-        tile_layout.addRow(self.tile_download_btn)
+        # Connect the cancel button to the cancel handler
+        self.tile_cancel_btn.clicked.connect(self._cancel_tile_download)
+        # Place the two buttons side by side using a horizontal layout.  This ensures
+        # they occupy a single row in the form layout.
+        buttons_layout = QtWidgets.QHBoxLayout()
+        buttons_layout.addWidget(self.tile_download_btn)
+        buttons_layout.addWidget(self.tile_cancel_btn)
+        tile_layout.addRow(buttons_layout)
         layout.addWidget(tile_group)
+        # Adjust size policies and stretch factors so that the map occupies the majority
+        # of available vertical space.  The control, data and tile downloader groups
+        # should not expand when the window is resized; only the map group should.
+        ctrl_group.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed)
+        data_group.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed)
+        map_group.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+        tile_group.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed)
+        # Assign stretch factors: 0 for non‑expanding panels, 1 for the map panel.
+        # The widgets are added in order: ctrl_group (index 0), data_group (1),
+        # map_group (2), tile_group (3).
+        layout.setStretch(0, 0)
+        layout.setStretch(1, 0)
+        layout.setStretch(2, 1)
+        layout.setStretch(3, 0)
 
         # Initialise GNSS attributes
         self.gnss_manager = None
